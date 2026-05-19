@@ -88,7 +88,7 @@ try {
 
 async function listRules() {
   const script = `
-$rules = Get-NetFirewallRule | Where-Object { $_.DisplayName -like '${RULE_PREFIX}*' }
+$rules = Get-NetFirewallRule -DisplayName '${RULE_PREFIX}*' -ErrorAction SilentlyContinue
 if (-not $rules) { Write-Output '[]'; exit 0 }
 $grouped = @{}
 foreach ($r in $rules) {
@@ -128,7 +128,7 @@ async function removeRules(paths) {
 $targets = '${safeJson}' | ConvertFrom-Json
 $removed = 0
 $errs = [System.Collections.Generic.List[string]]::new()
-$rules = Get-NetFirewallRule | Where-Object { $_.DisplayName -like '${RULE_PREFIX}*' }
+$rules = Get-NetFirewallRule -DisplayName '${RULE_PREFIX}*' -ErrorAction SilentlyContinue
 foreach ($r in $rules) {
   $app = Get-NetFirewallApplicationFilter -AssociatedNetFirewallRule $r
   if ($targets -contains $app.Program) {
@@ -154,7 +154,7 @@ async function removeAllRules() {
   const script = `
 $removed = 0
 $errs = [System.Collections.Generic.List[string]]::new()
-Get-NetFirewallRule | Where-Object { $_.DisplayName -like '${RULE_PREFIX}*' } | ForEach-Object {
+Get-NetFirewallRule -DisplayName '${RULE_PREFIX}*' -ErrorAction SilentlyContinue | ForEach-Object {
   try {
     Remove-NetFirewallRule -Name $_.Name
     $removed++

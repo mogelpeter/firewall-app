@@ -1,3 +1,19 @@
+// ── Rules cache ──────────────────────────────────────────────────
+// Avoids re-querying PowerShell on every tab switch.
+// Invalidated after any mutation (block/remove). Refresh button forces a fresh fetch.
+let rulesCache = null
+
+function invalidateRulesCache() { rulesCache = null }
+
+async function fetchRules(force = false) {
+  if (!force && rulesCache !== null) return rulesCache
+  rulesCache = await window.fw.listRules()
+  return rulesCache
+}
+
+// Prefetch in background so first tab click is instant
+window.fw.listRules().then(r => { rulesCache = r })
+
 // ── Navigation ───────────────────────────────────────────────────
 const navItems = document.querySelectorAll('.nav-item')
 const views    = document.querySelectorAll('.view')
@@ -69,6 +85,7 @@ bfBlock.addEventListener('click', async () => {
   bfSummary.innerHTML = ''
 
   const result = await window.fw.blockFolder(bfSelectedPath)
+  if (result.blocked > 0) invalidateRulesCache()
 
   bfLog.innerHTML = ''
   if (result.errors && result.errors.length > 0) {
@@ -130,6 +147,7 @@ beBlock.addEventListener('click', async () => {
   beMsg.innerHTML = '<span class="log-info">Blocking...</span>'
 
   const result = await window.fw.blockExe(beSelectedPath)
+  if (result.success) invalidateRulesCache()
 
   beMsg.innerHTML = result.success
     ? '<span class="msg-ok">✓ Blocked successfully</span>'
@@ -152,9 +170,9 @@ rulesView.innerHTML = `
 const vrRefresh = document.getElementById('vr-refresh')
 const vrContent = document.getElementById('vr-content')
 
-async function loadRules() {
-  vrContent.innerHTML = '<div class="empty-state">Loading...</div>'
-  const rules = await window.fw.listRules()
+async function loadRules(force = false) {
+  if (force || rulesCache === null) vrContent.innerHTML = '<div class="empty-state">Loading...</div>'
+  const rules = await fetchRules(force)
   if (!rules || rules.length === 0) {
     vrContent.innerHTML = '<div class="empty-state">No rules created by this tool.</div>'
     return
@@ -186,8 +204,8 @@ async function loadRules() {
   `
 }
 
-vrRefresh.addEventListener('click', loadRules)
-document.querySelector('[data-view="view-rules"]').addEventListener('click', loadRules)
+vrRefresh.addEventListener('click', () => loadRules(true))
+document.querySelector('[data-view="view-rules"]').addEventListener('click', () => loadRules())
 
 // ── Remove Rules ─────────────────────────────────────────────────
 const removeView = document.getElementById('view-remove-rules')
@@ -207,10 +225,10 @@ const rrRemoveSel = document.getElementById('rr-remove-sel')
 const rrRemoveAll = document.getElementById('rr-remove-all')
 const rrMsg       = document.getElementById('rr-msg')
 
-async function loadRemoveRules() {
+async function loadRemoveRules(force = false) {
   rrMsg.innerHTML = ''
-  rrContent.innerHTML = '<div class="empty-state">Loading...</div>'
-  const rules = await window.fw.listRules()
+  if (force || rulesCache === null) rrContent.innerHTML = '<div class="empty-state">Loading...</div>'
+  const rules = await fetchRules(force)
 
   if (!rules || rules.length === 0) {
     rrContent.innerHTML = '<div class="empty-state">No rules to remove.</div>'
@@ -249,6 +267,7 @@ rrRemoveSel.addEventListener('click', async () => {
   if (paths.length === 0) return
   setRRBusy(true)
   const result = await window.fw.removeRules(paths)
+  invalidateRulesCache()
   setRRBusy(false)
   rrMsg.innerHTML = result.errors.length
     ? `<span class="msg-err">Removed ${result.removed}, errors: ${result.errors.length}</span>`
@@ -260,6 +279,7 @@ rrRemoveAll.addEventListener('click', async () => {
   if (!confirm('Remove ALL firewall rules created by this tool?')) return
   setRRBusy(true)
   const result = await window.fw.removeAllRules()
+  invalidateRulesCache()
   setRRBusy(false)
   rrMsg.innerHTML = result.errors.length
     ? `<span class="msg-err">Removed ${result.removed}, errors: ${result.errors.length}</span>`
@@ -267,4 +287,4 @@ rrRemoveAll.addEventListener('click', async () => {
   await loadRemoveRules()
 })
 
-document.querySelector('[data-view="remove-rules"]').addEventListener('click', loadRemoveRules)
+document.querySelector('[data-view="remove-rules"]').addEventListener('click', () => loadRemoveRules())

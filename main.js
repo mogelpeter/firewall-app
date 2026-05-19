@@ -1,5 +1,6 @@
 const { app, BrowserWindow, ipcMain, dialog } = require('electron')
 const path = require('path')
+const { execFileSync } = require('child_process')
 const {
   checkAdmin, blockFolder, blockExe, listRules, removeRules, removeAllRules
 } = require('./firewall')
@@ -24,12 +25,24 @@ function createWindow() {
 app.whenReady().then(async () => {
   const isAdmin = await checkAdmin()
   if (!isAdmin) {
-    await dialog.showMessageBox({
-      type: 'error',
-      title: 'Administrator Required',
-      message: 'Firewall Manager requires administrator privileges.\nPlease right-click and run as administrator.',
-      buttons: ['OK'],
-    })
+    try {
+      // Re-launch the current process with UAC elevation via PowerShell Start-Process -Verb RunAs
+      const safePath = process.execPath.replace(/'/g, "''")
+      const extraArgs = process.argv.slice(1)
+      const safeArgs = extraArgs.map(a => `'${a.replace(/'/g, "''")}'`).join(', ')
+      const psCmd = extraArgs.length > 0
+        ? `Start-Process -FilePath '${safePath}' -ArgumentList @(${safeArgs}) -Verb RunAs`
+        : `Start-Process -FilePath '${safePath}' -Verb RunAs`
+      execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', psCmd])
+    } catch {
+      // UAC was declined by user — show a brief notice
+      await dialog.showMessageBox({
+        type: 'warning',
+        title: 'Administrator Required',
+        message: 'Firewall Manager needs administrator privileges to manage Windows Firewall rules.',
+        buttons: ['OK'],
+      })
+    }
     app.quit()
     return
   }

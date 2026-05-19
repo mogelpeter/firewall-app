@@ -25,21 +25,32 @@ function createWindow() {
 app.whenReady().then(async () => {
   const isAdmin = await checkAdmin()
   if (!isAdmin) {
-    try {
-      // Re-launch the current process with UAC elevation via PowerShell Start-Process -Verb RunAs
-      const safePath = process.execPath.replace(/'/g, "''")
-      const extraArgs = process.argv.slice(1)
-      const safeArgs = extraArgs.map(a => `'${a.replace(/'/g, "''")}'`).join(', ')
-      const psCmd = extraArgs.length > 0
-        ? `Start-Process -FilePath '${safePath}' -ArgumentList @(${safeArgs}) -Verb RunAs`
-        : `Start-Process -FilePath '${safePath}' -Verb RunAs`
-      execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', psCmd])
-    } catch {
-      // UAC was declined by user — show a brief notice
+    if (!app.isPackaged) {
+      // Dev mode: re-launch via PowerShell so UAC fires (manifest not embedded in dev)
+      try {
+        const safePath = process.execPath.replace(/'/g, "''")
+        const extraArgs = process.argv.slice(1)
+        const safeArgs = extraArgs.map(a => `'${a.replace(/'/g, "''")}'`).join(', ')
+        const psCmd = extraArgs.length > 0
+          ? `Start-Process -FilePath '${safePath}' -ArgumentList @(${safeArgs}) -Verb RunAs`
+          : `Start-Process -FilePath '${safePath}' -Verb RunAs`
+        execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', psCmd])
+      } catch {
+        // UAC declined
+        await dialog.showMessageBox({
+          type: 'warning',
+          title: 'Administrator Required',
+          message: 'Firewall Manager needs administrator privileges to manage Windows Firewall rules.',
+          buttons: ['OK'],
+        })
+      }
+    } else {
+      // Packaged: the exe manifest already requests admin — if we still land here,
+      // the user ran it without elevation somehow; just tell them.
       await dialog.showMessageBox({
         type: 'warning',
         title: 'Administrator Required',
-        message: 'Firewall Manager needs administrator privileges to manage Windows Firewall rules.',
+        message: 'Firewall Manager needs administrator privileges.\nPlease run as administrator.',
         buttons: ['OK'],
       })
     }

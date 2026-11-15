@@ -34,6 +34,10 @@ fn agent() -> ureq::Agent {
 
 /// `Ok(None)` = up to date.
 pub fn check() -> Result<Option<Update>, String> {
+    check_from(CURRENT)
+}
+
+fn check_from(current: &str) -> Result<Option<Update>, String> {
     let v: serde_json::Value = agent()
         .get(API)
         .set("Accept", "application/vnd.github+json")
@@ -42,7 +46,7 @@ pub fn check() -> Result<Option<Update>, String> {
         .into_json()
         .map_err(|e| e.to_string())?;
     let tag = v["tag_name"].as_str().ok_or("no tag")?;
-    let (new, cur) = (parse(tag).ok_or("bad tag")?, parse(CURRENT).ok_or("bad version")?);
+    let (new, cur) = (parse(tag).ok_or("bad tag")?, parse(current).ok_or("bad version")?);
     if new <= cur {
         return Ok(None);
     }
@@ -82,6 +86,16 @@ pub fn cleanup() {
 
 /// Downloads, verifies and starts the installer silently. The caller should exit afterwards.
 pub fn install(u: &Update, progress: impl Fn(u64, u64)) -> Result<(), String> {
+    let file = download_verified(u, progress)?;
+    std::process::Command::new(&file)
+        .args(["/SILENT", "/NORESTART", "/CLOSEAPPLICATIONS"])
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Downloads the installer into the admin-only data folder and verifies its SHA-256.
+fn download_verified(u: &Update, progress: impl Fn(u64, u64)) -> Result<PathBuf, String> {
     let dir = update_dir()?;
     let file = dir.join(ASSET);
     let resp = agent().get(&u.url).call().map_err(|e| e.to_string())?;
@@ -105,11 +119,7 @@ pub fn install(u: &Update, progress: impl Fn(u64, u64)) -> Result<(), String> {
         let _ = std::fs::remove_file(&file);
         return Err("download does not match the published checksum, update refused".into());
     }
-    std::process::Command::new(&file)
-        .args(["/SILENT", "/NORESTART", "/CLOSEAPPLICATIONS"])
-        .spawn()
-        .map_err(|e| e.to_string())?;
-    Ok(())
+    Ok(file)
 }
 
 #[cfg(test)]
@@ -120,5 +130,20 @@ mod tests {
     fn versions_compare() {
         assert!(parse("v2.10.0") > parse("2.9.9"));
         assert_eq!(parse("junk"), None);
+    }
+
+    /// Network + elevated (writes to the admin-only data folder): `cargo test -- --ignored`
+    #[test]
+    #[ignore]
+    fn finds_and_downloads_newer_release() {
+        let u = check_from("0.0.1").unwrap().expect("a release newer than 0.0.1");
+        assert!(u.url.starts_with(DOWNLOAD_PREFIX) && u.sha256.len() == 64);
+        assert!(check_from("999.0.0").unwrap().is_none());
+        let f = download_verified(&u, |_, _| {}).unwrap();
+        println!("verified download: {}", f.display());
+        let mut bad = u.clone();
+        bad.sha256 = "0".repeat(64);
+        assert!(download_verified(&bad, |_, _| {}).unwrap_err().contains("checksum"));
+        assert!(!f.exists(), "a failed verification must delete the file");
     }
 }

@@ -161,8 +161,49 @@ fn valid_entry(l: &str) -> bool {
         && p.extension().map(|e| e.eq_ignore_ascii_case("exe")).unwrap_or(false)
 }
 
+/// Creates the store folder and locks it down: owner Administrators, no inheritance,
+/// SYSTEM + Administrators full control, Users read-only. Refuses reparse points.
+/// Returns false (store disabled) if anything fails. Runs once per process.
+fn secure_dir() -> Option<PathBuf> {
+    use std::os::windows::fs::MetadataExt;
+    use std::os::windows::process::CommandExt;
+    use std::sync::OnceLock;
+    static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let d = store_file()?.parent()?.to_path_buf();
+        std::fs::create_dir_all(&d).ok()?;
+        const REPARSE: u32 = 0x400;
+        if std::fs::symlink_metadata(&d).ok()?.file_attributes() & REPARSE != 0 {
+            return None;
+        }
+        let icacls = |args: &[&str]| {
+            std::process::Command::new("icacls")
+                .arg(&d)
+                .args(args)
+                .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+        let ok = icacls(&["/setowner", "*S-1-5-32-544", "/T", "/C", "/Q"])
+            && icacls(&[
+                "/inheritance:r",
+                "/grant:r",
+                "*S-1-5-18:(OI)(CI)F",
+                "*S-1-5-32-544:(OI)(CI)F",
+                "*S-1-5-32-545:(OI)(CI)RX",
+                "/T",
+                "/C",
+                "/Q",
+            ]);
+        ok.then_some(d)
+    })
+    .clone()
+}
+
 fn store_load() -> Vec<String> {
-    let Some(f) = store_file() else { return vec![] };
+    let Some(d) = secure_dir() else { return vec![] };
+    let f = d.join("blocked.txt");
     let mut seen = HashSet::new();
     std::fs::read_to_string(f)
         .unwrap_or_default()
@@ -174,11 +215,9 @@ fn store_load() -> Vec<String> {
 }
 
 fn store_save(paths: &[String]) {
-    let Some(f) = store_file() else { return };
-    if let Some(d) = f.parent() {
-        let _ = std::fs::create_dir_all(d);
-    }
-    let tmp = f.with_extension("tmp");
+    let Some(d) = secure_dir() else { return };
+    let f = d.join("blocked.txt");
+    let tmp = d.join("blocked.tmp");
     if std::fs::write(&tmp, paths.join("
 ")).is_ok() {
         let _ = std::fs::rename(&tmp, &f);

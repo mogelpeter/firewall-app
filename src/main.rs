@@ -11,17 +11,18 @@ use eframe::egui::{self, Color32, RichText};
 use fw::{BlockReport, BlockedProgram, RemoveReport};
 
 // ---- palette ---------------------------------------------------------------
-const BG: Color32 = Color32::from_rgb(20, 23, 31);
-const PANEL: Color32 = Color32::from_rgb(26, 30, 41);
-const CARD: Color32 = Color32::from_rgb(33, 39, 55);
-const CARD_HI: Color32 = Color32::from_rgb(42, 49, 69);
-const ACCENT: Color32 = Color32::from_rgb(226, 78, 66);
-const INFO: Color32 = Color32::from_rgb(96, 165, 250);
+const BG: Color32 = Color32::from_rgb(8, 6, 13);
+const PANEL: Color32 = Color32::from_rgb(14, 10, 22);
+const CARD: Color32 = Color32::from_rgb(21, 16, 33);
+const CARD_HI: Color32 = Color32::from_rgb(34, 25, 52);
+const LINE: Color32 = Color32::from_rgb(48, 36, 74);
+const ACCENT: Color32 = Color32::from_rgb(139, 92, 246);
+const INFO: Color32 = Color32::from_rgb(196, 181, 253);
 const OK: Color32 = Color32::from_rgb(74, 201, 120);
 const WARN: Color32 = Color32::from_rgb(235, 170, 60);
 const BAD: Color32 = Color32::from_rgb(240, 100, 100);
-const TEXT: Color32 = Color32::from_rgb(228, 232, 240);
-const MUTED: Color32 = Color32::from_rgb(140, 149, 170);
+const TEXT: Color32 = Color32::from_rgb(250, 248, 255);
+const MUTED: Color32 = Color32::from_rgb(166, 154, 196);
 
 #[derive(PartialEq, Clone, Copy)]
 enum Tab {
@@ -119,36 +120,55 @@ fn main() -> eframe::Result<()> {
     eframe::run_native("Firewall Manager", opts, Box::new(|cc| Ok(Box::new(App::new(cc)))))
 }
 
+/// JetBrains Mono (SIL OFL, see assets/fonts) for everything; a separate "bold" family for emphasis.
+fn setup_fonts(ctx: &egui::Context) {
+    use egui::{FontData, FontFamily};
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert("jbm".into(), std::sync::Arc::new(FontData::from_static(include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf"))));
+    fonts.font_data.insert("jbm-bold".into(), std::sync::Arc::new(FontData::from_static(include_bytes!("../assets/fonts/JetBrainsMono-Bold.ttf"))));
+    for fam in [FontFamily::Proportional, FontFamily::Monospace] {
+        fonts.families.entry(fam).or_default().insert(0, "jbm".into());
+    }
+    fonts.families.insert(FontFamily::Name("bold".into()), vec!["jbm-bold".into(), "jbm".into()]);
+    ctx.set_fonts(fonts);
+}
+
+/// Bold JetBrains Mono text.
+fn bold(t: impl Into<String>, size: f32) -> RichText {
+    RichText::new(t.into()).font(egui::FontId::new(size, egui::FontFamily::Name("bold".into())))
+}
+
 fn setup_style(ctx: &egui::Context) {
+    setup_fonts(ctx);
     let mut v = egui::Visuals::dark();
     v.panel_fill = BG;
     v.window_fill = CARD;
-    v.extreme_bg_color = Color32::from_rgb(15, 18, 25);
-    v.faint_bg_color = Color32::from_rgb(28, 33, 46);
+    v.extreme_bg_color = Color32::from_rgb(4, 3, 8);
+    v.faint_bg_color = Color32::from_rgb(17, 12, 27);
     v.override_text_color = Some(TEXT);
     v.selection.bg_fill = ACCENT.linear_multiply(0.55);
     v.window_corner_radius = 12.into();
     v.menu_corner_radius = 8.into();
-    v.window_stroke = egui::Stroke::new(1.0_f32, Color32::from_rgb(55, 63, 85));
+    v.window_stroke = egui::Stroke::new(1.0_f32, LINE);
     for w in [&mut v.widgets.noninteractive, &mut v.widgets.inactive, &mut v.widgets.hovered, &mut v.widgets.active] {
         w.corner_radius = 8.into();
     }
     v.widgets.inactive.bg_fill = CARD_HI;
     v.widgets.inactive.weak_bg_fill = CARD_HI;
-    v.widgets.hovered.bg_fill = Color32::from_rgb(54, 63, 88);
-    v.widgets.hovered.weak_bg_fill = Color32::from_rgb(54, 63, 88);
-    v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, Color32::from_rgb(45, 52, 72));
+    v.widgets.hovered.bg_fill = Color32::from_rgb(52, 38, 82);
+    v.widgets.hovered.weak_bg_fill = Color32::from_rgb(52, 38, 82);
+    v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, LINE);
     ctx.set_visuals(v);
     ctx.style_mut(|s| {
         s.spacing.item_spacing = egui::vec2(10.0, 10.0);
-        s.spacing.button_padding = egui::vec2(14.0, 8.0);
+        s.spacing.button_padding = egui::vec2(14.0, 7.0);
         s.spacing.interact_size.y = 30.0;
         s.spacing.scroll.bar_width = 8.0;
         use egui::{FontFamily::Proportional, FontId, TextStyle::*};
-        s.text_styles.insert(Heading, FontId::new(24.0, Proportional));
-        s.text_styles.insert(Body, FontId::new(14.5, Proportional));
-        s.text_styles.insert(Button, FontId::new(14.5, Proportional));
-        s.text_styles.insert(Small, FontId::new(12.0, Proportional));
+        s.text_styles.insert(Heading, FontId::new(19.0, Proportional));
+        s.text_styles.insert(Body, FontId::new(12.5, Proportional));
+        s.text_styles.insert(Button, FontId::new(12.5, Proportional));
+        s.text_styles.insert(Small, FontId::new(10.5, Proportional));
     });
 }
 
@@ -358,7 +378,7 @@ fn card<R>(ui: &mut egui::Ui, fill: Color32, add: impl FnOnce(&mut egui::Ui) -> 
         .fill(fill)
         .corner_radius(12)
         .inner_margin(egui::Margin::same(16))
-        .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(45, 52, 72)))
+        .stroke(egui::Stroke::new(1.0_f32, LINE))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             add(ui)
@@ -369,15 +389,15 @@ fn card<R>(ui: &mut egui::Ui, fill: Color32, add: impl FnOnce(&mut egui::Ui) -> 
 /// Explanation box shown at the top of the block pages.
 fn info_box(ui: &mut egui::Ui, title: &str, lines: &[&str]) {
     egui::Frame::new()
-        .fill(INFO.linear_multiply(0.10))
+        .fill(Color32::from_rgb(27, 19, 48))
         .corner_radius(12)
         .inner_margin(egui::Margin::same(14))
-        .stroke(egui::Stroke::new(1.0_f32, INFO.linear_multiply(0.45)))
+        .stroke(egui::Stroke::new(1.0_f32, ACCENT.linear_multiply(0.55)))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
-                ui.label(RichText::new("i").strong().color(INFO).size(15.0));
-                ui.label(RichText::new(title).strong().color(INFO));
+                ui.label(bold("i", 13.0).color(INFO));
+                ui.label(bold(title, 12.5).color(INFO));
             });
             for l in lines {
                 ui.label(RichText::new(format!("•  {l}")).color(TEXT));
@@ -386,13 +406,13 @@ fn info_box(ui: &mut egui::Ui, title: &str, lines: &[&str]) {
 }
 
 fn page_header(ui: &mut egui::Ui, title: &str, sub: &str) {
-    ui.label(RichText::new(title).heading().strong());
+    ui.label(bold(title, 20.0));
     ui.label(RichText::new(sub).color(MUTED));
     ui.add_space(4.0);
 }
 
 fn primary(text: impl Into<String>) -> egui::Button<'static> {
-    egui::Button::new(RichText::new(text.into()).color(Color32::WHITE).strong()).fill(ACCENT)
+    egui::Button::new(bold(text, 12.5).color(Color32::WHITE)).fill(ACCENT)
 }
 
 fn chip(ui: &mut egui::Ui, text: &str, color: Color32) {
@@ -401,7 +421,7 @@ fn chip(ui: &mut egui::Ui, text: &str, color: Color32) {
         .corner_radius(20)
         .inner_margin(egui::Margin::symmetric(10, 3))
         .show(ui, |ui| {
-            ui.label(RichText::new(text).color(color).size(12.5).strong());
+            ui.label(bold(text, 11.0).color(color));
         });
 }
 
@@ -412,14 +432,14 @@ fn log_view(ui: &mut egui::Ui, log: &[(bool, String)]) {
     card(ui, PANEL, |ui| {
         egui::ScrollArea::vertical().id_salt("log").max_height(100.0).show(ui, |ui| {
             for (ok, line) in log {
-                ui.label(RichText::new(line).color(if *ok { OK } else { BAD }).monospace().size(12.0));
+                ui.label(RichText::new(line).color(if *ok { OK } else { BAD }).monospace().size(11.0));
             }
         });
     });
 }
 
 fn path_label(p: &str) -> RichText {
-    RichText::new(p).monospace().size(12.5)
+    RichText::new(p).monospace().size(11.5)
 }
 
 impl eframe::App for App {
@@ -474,8 +494,8 @@ impl App {
                     }
                     ui.vertical(|ui| {
                         ui.add_space(-2.0);
-                        ui.label(RichText::new("Firewall").strong().size(16.0));
-                        ui.label(RichText::new("Manager").strong().size(16.0));
+                        ui.label(bold("Firewall", 14.0));
+                        ui.label(bold("Manager", 14.0));
                     });
                 });
                 ui.add_space(18.0);
@@ -507,7 +527,7 @@ impl App {
                         rect.left_center() + egui::vec2(14.0, 0.0),
                         egui::Align2::LEFT_CENTER,
                         label,
-                        egui::FontId::proportional(14.5),
+                        egui::FontId::proportional(12.5),
                         if sel { Color32::WHITE } else { TEXT },
                     );
                     if resp.clicked() {
@@ -521,7 +541,7 @@ impl App {
                     }
                 }
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-                    ui.label(RichText::new(format!("v{}", update::CURRENT)).color(MUTED).size(12.0));
+                    ui.label(RichText::new(format!("v{}", update::CURRENT)).color(MUTED).size(10.5));
                     let txt = match &self.upd {
                         Upd::Checking => "Checking for updates...".to_string(),
                         Upd::UpToDate => "Up to date".to_string(),
@@ -529,7 +549,7 @@ impl App {
                         Upd::Installing(s) => s.clone(),
                         Upd::Failed(_) => "Update check failed".to_string(),
                     };
-                    let r = ui.label(RichText::new(txt).color(MUTED).size(12.0));
+                    let r = ui.label(RichText::new(txt).color(MUTED).size(10.5));
                     if let Upd::Failed(e) = &self.upd {
                         r.on_hover_text(e);
                     }
@@ -552,7 +572,7 @@ impl App {
                         ui.label(l);
                     }
                     _ => {
-                        ui.label(RichText::new("Ready   ·   drop a folder or .exe files onto the window").color(MUTED).size(12.5));
+                        ui.label(RichText::new("Ready   ·   drop a folder or .exe files onto the window").color(MUTED).size(11.0));
                     }
                 });
             });
@@ -569,7 +589,7 @@ impl App {
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new(format!("Version {} is available (you have {}).", u.version, update::CURRENT)).color(OK).strong());
+                        ui.label(bold(format!("Version {} is available (you have {}).", u.version, update::CURRENT), 12.0).color(OK));
                         if ui.add(primary("Update now")).clicked() {
                             self.start_update(ctx, u.clone());
                         }
@@ -703,12 +723,17 @@ impl App {
                 if ui.button("Refresh").clicked() {
                     self.reload(ctx);
                 }
-                if lost > 0 && ui.button(format!("Restore {lost} missing rule(s)")).clicked() {
+                if lost > 0 && ui.button(format!("Restore {lost} missing")).clicked() {
                     self.spawn("Restoring rules...", ctx, |tx| {
                         let _ = fw::restore_missing();
                         let _ = tx.send(Msg::Listed(fw::list_blocked()));
                     });
                 }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add_enabled(!self.blocked.is_empty(), egui::Button::new("Remove all")).clicked() {
+                        self.confirm_all = true;
+                    }
+                });
             });
             ui.horizontal_wrapped(|ui| {
                 if ui.button("Select shown").clicked() {
@@ -732,9 +757,6 @@ impl App {
                         .map(|b| b.path.clone())
                         .collect();
                     self.remove(ctx, Some(paths));
-                }
-                if ui.add_enabled(!self.blocked.is_empty(), egui::Button::new("Remove all")).clicked() {
-                    self.confirm_all = true;
                 }
             });
             if let Some((ok, m)) = &self.list_msg {
@@ -767,13 +789,16 @@ impl App {
             return;
         }
 
-        // Column header
+        // Column header (same widths as the rows below)
         ui.horizontal(|ui| {
-            ui.add_space(40.0);
+            ui.add_space(42.0);
             for (w, t) in [(204.0, "PROGRAM"), (104.0, "DIRECTION"), (104.0, "STATE")] {
-                ui.add_sized([w, 16.0], egui::Label::new(RichText::new(t).color(MUTED).size(11.5).strong()));
+                ui.scope(|ui| {
+                    ui.set_width(w);
+                    ui.label(bold(t, 10.5).color(MUTED));
+                });
             }
-            ui.label(RichText::new("PATH").color(MUTED).size(11.5).strong());
+            ui.label(bold("PATH", 10.5).color(MUTED));
         });
 
         let row_h = 34.0;
@@ -806,7 +831,10 @@ impl App {
                 let mut c = sel;
                 rui.add_enabled(false, egui::Checkbox::without_text(&mut c));
                 rui.add_space(6.0);
-                rui.add_sized([204.0, 20.0], egui::Label::new(RichText::new(&b.name).strong()).truncate());
+                rui.scope(|ui| {
+                    ui.set_width(204.0);
+                    ui.add(egui::Label::new(bold(b.name.clone(), 12.0)).truncate());
+                });
                 let dir = match (b.inbound, b.outbound) {
                     (true, true) => ("In + Out", OK),
                     (true, false) => ("In only", WARN),
@@ -827,7 +855,7 @@ impl App {
                         chip(ui, "Disabled", MUTED);
                     }
                 });
-                let mut path = RichText::new(&b.path).monospace().size(11.5).color(if b.exists { MUTED } else { WARN });
+                let mut path = RichText::new(&b.path).monospace().size(10.5).color(if b.exists { MUTED } else { WARN });
                 if !b.exists {
                     path = path.strikethrough();
                 }

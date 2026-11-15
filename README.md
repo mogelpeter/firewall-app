@@ -6,7 +6,7 @@ A small native Windows app (Rust + egui) to block programs in Windows Firewall: 
 
 ## Install
 
-Download `FirewallManager-Setup.exe` from the [latest release](../../releases/latest) and run it. It installs to `%ProgramFiles%\FirewallManager`, adds a Start menu entry (optional desktop shortcut) and an uninstaller.
+Download `FirewallManager-Setup.exe` from the [latest release](../../releases/latest) and run it. It installs to `%ProgramFiles%\FirewallManager`, adds a Start menu entry and an uninstaller, and asks after installing whether to create a desktop shortcut.
 
 The app asks for administrator rights once when it starts (UAC), which Windows requires to change firewall rules.
 
@@ -39,7 +39,7 @@ cargo test -- --ignored                                 # firewall round trip, n
 ISCC /DAppVersion=<version> installer\FirewallManager.iss   # target\installer\FirewallManager-Setup.exe
 ```
 
-`assets/make_icon.py` regenerates the icon (needs Pillow). Releases must contain an asset named `FirewallManager-Setup.exe`, which is what the updater looks for.
+`assets/make_icon.py` regenerates the icon (needs Pillow). The UI font is JetBrains Mono (SIL Open Font License, `assets/fonts/LICENSE-JetBrainsMono.txt`). Releases must contain an asset named `FirewallManager-Setup.exe`, which is what the updater looks for.
 
 ## License
 

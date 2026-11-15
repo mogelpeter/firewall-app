@@ -114,6 +114,7 @@ impl App {
         };
         // Prefetch so the list is ready by the time the tab is opened.
         app.spawn("Loading rules...", &cc.egui_ctx, |tx| {
+            let _ = fw::restore_missing();
             let _ = tx.send(Msg::Listed(fw::list_blocked()));
         });
         app
@@ -429,6 +430,13 @@ impl App {
             if ui.button("Refresh").clicked() {
                 self.reload(ctx);
             }
+            let lost = self.blocked.iter().filter(|b| !b.active_rules).count();
+            if ui.add_enabled(lost > 0, egui::Button::new(format!("Restore missing rules ({lost})"))).clicked() {
+                self.spawn("Restoring rules...", ctx, |tx| {
+                    let _ = fw::restore_missing();
+                    let _ = tx.send(Msg::Listed(fw::list_blocked()));
+                });
+            }
         });
         let f = self.filter.to_lowercase();
         let shown: Vec<usize> = (0..self.blocked.len())
@@ -510,7 +518,11 @@ impl App {
                     ui.label(RichText::new(&b.name).strong());
                     badge(ui, b.inbound, "In", "–");
                     badge(ui, b.outbound, "Out", "–");
-                    badge(ui, b.enabled, "Active", "Inactive");
+                    if b.active_rules {
+                        badge(ui, b.enabled, "Active", "Inactive");
+                    } else {
+                        ui.label(RichText::new("Not in firewall").color(Color32::from_rgb(230, 170, 60)));
+                    }
                     let mut path = RichText::new(&b.path).monospace().size(11.0);
                     if !b.exists {
                         path = path.color(Color32::from_rgb(230, 170, 60));

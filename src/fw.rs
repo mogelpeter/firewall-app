@@ -52,6 +52,8 @@ pub struct BlockedProgram {
     pub outbound: bool,
     pub enabled: bool,
     pub exists: bool,
+    /// false when remembered but currently without any firewall rule
+    pub active_rules: bool,
 }
 
 #[derive(Default, Debug, Clone)]
@@ -141,6 +143,89 @@ fn our_rules(rules: &INetFwRules) -> Result<Vec<RawRule>> {
     Ok(out)
 }
 
+
+// ---- persistent list --------------------------------------------------------
+// The firewall is the source of truth, but we also remember every blocked program in
+// %APPDATA%\FirewallManagerlocked.txt so the list survives updates, reinstalls and
+// rules that get wiped, and can be restored.
+
+fn store_file() -> Option<PathBuf> {
+    std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join("FirewallManager").join("blocked.txt"))
+}
+
+fn store_load() -> Vec<String> {
+    let Some(f) = store_file() else { return vec![] };
+    let mut seen = HashSet::new();
+    std::fs::read_to_string(f)
+        .unwrap_or_default()
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty() && seen.insert(path_key(l)))
+        .map(String::from)
+        .collect()
+}
+
+fn store_save(paths: &[String]) {
+    let Some(f) = store_file() else { return };
+    if let Some(d) = f.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let tmp = f.with_extension("tmp");
+    if std::fs::write(&tmp, paths.join("
+")).is_ok() {
+        let _ = std::fs::rename(&tmp, &f);
+    }
+}
+
+fn store_add(new: &[String]) {
+    let mut cur = store_load();
+    let mut keys: HashSet<String> = cur.iter().map(|p| path_key(p)).collect();
+    let before = cur.len();
+    for p in new {
+        if keys.insert(path_key(p)) {
+            cur.push(p.clone());
+        }
+    }
+    if cur.len() != before {
+        store_save(&cur);
+    }
+}
+
+fn store_remove(keys: Option<&HashSet<String>>) {
+    match keys {
+        None => store_save(&[]),
+        Some(k) => {
+            let cur = store_load();
+            let kept: Vec<String> = cur.iter().filter(|p| !k.contains(&path_key(p))).cloned().collect();
+            if kept.len() != cur.len() {
+                store_save(&kept);
+            }
+        }
+    }
+}
+
+/// Re-creates any missing rule (either direction) for every remembered program.
+/// Returns how many rules were created.
+pub fn restore_missing() -> Result<usize> {
+    let _com = ComGuard::new();
+    let pol = policy()?;
+    let rules = unsafe { pol.Rules() }.map_err(err)?;
+    let live = our_rules(&rules)?;
+    let mut have: HashSet<(String, bool)> = live.iter().map(|r| (path_key(&r.app), r.inbound)).collect();
+    store_add(&live.iter().map(|r| r.app.clone()).collect::<Vec<_>>()); // adopt rules from older versions
+    let mut n = 0;
+    for p in store_load() {
+        for inbound in [true, false] {
+            let k = (path_key(&p), inbound);
+            if !have.contains(&k) && add_rule(&rules, &p, inbound).is_ok() {
+                have.insert(k);
+                n += 1;
+            }
+        }
+    }
+    Ok(n)
+}
+
 /// All programs blocked by this tool, sorted by name.
 pub fn list_blocked() -> Result<Vec<BlockedProgram>> {
     let _com = ComGuard::new();
@@ -159,6 +244,7 @@ pub fn list_blocked() -> Result<Vec<BlockedProgram>> {
             inbound: false,
             outbound: false,
             enabled: false,
+            active_rules: true,
         });
         if r.inbound {
             e.inbound = true;
@@ -166,6 +252,20 @@ pub fn list_blocked() -> Result<Vec<BlockedProgram>> {
             e.outbound = true;
         }
         e.enabled |= r.enabled;
+    }
+    let live: Vec<String> = map.values().map(|b| b.path.clone()).collect();
+    store_add(&live);
+    for p in store_load() {
+        let key = path_key(&p);
+        map.entry(key).or_insert_with(|| BlockedProgram {
+            name: Path::new(&p).file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| p.clone()),
+            exists: Path::new(&p).is_file(),
+            path: p,
+            inbound: false,
+            outbound: false,
+            enabled: false,
+            active_rules: false,
+        });
     }
     let mut v: Vec<_> = map.into_values().collect();
     v.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()).then(a.path.cmp(&b.path)));
@@ -215,6 +315,7 @@ pub fn block_files(files: &[PathBuf], mut progress: impl FnMut(usize, usize)) ->
         } else {
             match add_rule(&rules, &p, true).and_then(|_| add_rule(&rules, &p, false)) {
                 Ok(()) => {
+                    store_add(&[p.clone()]);
                     have.insert(key);
                     rep.blocked += 1;
                 }
@@ -244,10 +345,12 @@ fn remove_where(pred: impl Fn(&RawRule) -> bool) -> Result<RemoveReport> {
 /// Removes every rule of this tool that belongs to one of the given program paths.
 pub fn remove_paths(paths: &[String]) -> Result<RemoveReport> {
     let set: HashSet<String> = paths.iter().map(|p| path_key(p)).collect();
+    store_remove(Some(&set));
     remove_where(|r| set.contains(&path_key(&r.app)))
 }
 
 pub fn remove_all() -> Result<RemoveReport> {
+    store_remove(None);
     remove_where(|_| true)
 }
 
@@ -341,6 +444,16 @@ mod com_tests {
         println!("list took {:?}", t.elapsed());
         let me = l.iter().find(|b| b.name == "fwm_roundtrip.exe").expect("listed");
         assert!(me.inbound && me.outbound && me.enabled && me.exists);
+        // rules wiped behind our back are restored from the remembered list
+        let name = rule_name(&exe.to_string_lossy(), true);
+        {
+            let _c = ComGuard::new();
+            let rules = unsafe { policy().unwrap().Rules() }.unwrap();
+            unsafe { rules.Remove(&BSTR::from(name)) }.unwrap();
+        }
+        assert!(!list_blocked().unwrap().iter().find(|b| b.name == "fwm_roundtrip.exe").unwrap().inbound);
+        assert!(restore_missing().unwrap() >= 1);
+        assert!(list_blocked().unwrap().iter().find(|b| b.name == "fwm_roundtrip.exe").unwrap().inbound);
         let r = remove_paths(&[exe.to_string_lossy().into_owned()]).unwrap();
         assert_eq!(r.removed, 2, "{:?}", r);
         assert!(!list_blocked().unwrap().iter().any(|b| b.name == "fwm_roundtrip.exe"));

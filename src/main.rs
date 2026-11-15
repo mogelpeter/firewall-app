@@ -1,18 +1,41 @@
 #![windows_subsystem = "windows"]
 
 mod fw;
+mod update;
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
 
 use eframe::egui::{self, Color32, RichText};
 use fw::{BlockReport, BlockedProgram, RemoveReport};
 
+// ---- palette ---------------------------------------------------------------
+const BG: Color32 = Color32::from_rgb(20, 23, 31);
+const PANEL: Color32 = Color32::from_rgb(26, 30, 41);
+const CARD: Color32 = Color32::from_rgb(33, 39, 55);
+const CARD_HI: Color32 = Color32::from_rgb(42, 49, 69);
+const ACCENT: Color32 = Color32::from_rgb(226, 78, 66);
+const INFO: Color32 = Color32::from_rgb(96, 165, 250);
+const OK: Color32 = Color32::from_rgb(74, 201, 120);
+const WARN: Color32 = Color32::from_rgb(235, 170, 60);
+const BAD: Color32 = Color32::from_rgb(240, 100, 100);
+const TEXT: Color32 = Color32::from_rgb(228, 232, 240);
+const MUTED: Color32 = Color32::from_rgb(140, 149, 170);
+
 #[derive(PartialEq, Clone, Copy)]
 enum Tab {
     Folder,
     Exe,
     Blocked,
+}
+
+enum Upd {
+    Checking,
+    UpToDate,
+    Available(update::Update),
+    Installing(String),
+    Failed(String),
 }
 
 enum Msg {
@@ -22,6 +45,10 @@ enum Msg {
     Listed(Result<Vec<BlockedProgram>, String>),
     Removed(RemoveReport),
     Failed(String),
+    UpdateChecked(Result<Option<update::Update>, String>),
+    UpdateProgress(String),
+    UpdateFailed(String),
+    UpdateStarted,
 }
 
 struct App {
@@ -30,20 +57,19 @@ struct App {
     rx: Receiver<Msg>,
     busy: Option<String>,
     progress: Option<(usize, usize)>,
+    icon: Option<egui::TextureHandle>,
+    upd: Upd,
 
-    // block folder
     folder: Option<PathBuf>,
     scan_files: Vec<PathBuf>,
     scan_already: usize,
     folder_log: Vec<(bool, String)>,
 
-    // block exe
     exes: Vec<PathBuf>,
     exe_log: Vec<(bool, String)>,
 
-    // blocked list
     blocked: Vec<BlockedProgram>,
-    selected: std::collections::HashSet<String>,
+    selected: HashSet<String>,
     filter: String,
     loaded: bool,
     list_msg: Option<(bool, String)>,
@@ -54,7 +80,7 @@ fn is_elevated() -> bool {
     unsafe { windows::Win32::UI::Shell::IsUserAnAdmin().as_bool() }
 }
 
-/// Relaunches this exe elevated (UAC prompt). Returns true if the new process was started.
+/// Relaunches this exe elevated (one UAC prompt). Returns true if the new process was started.
 fn relaunch_elevated() -> bool {
     use windows::core::{w, HSTRING, PCWSTR};
     use windows::Win32::UI::Shell::ShellExecuteW;
@@ -67,21 +93,20 @@ fn relaunch_elevated() -> bool {
 }
 
 fn main() -> eframe::Result<()> {
-    if !is_elevated() && !relaunch_elevated() {
-        rfd::MessageDialog::new()
-            .set_level(rfd::MessageLevel::Warning)
-            .set_title("Administrator required")
-            .set_description("Firewall Manager needs administrator rights to manage Windows Firewall rules.")
-            .show();
-        return Ok(());
-    }
     if !is_elevated() {
-        return Ok(()); // the elevated copy took over
+        if !relaunch_elevated() {
+            rfd::MessageDialog::new()
+                .set_level(rfd::MessageLevel::Warning)
+                .set_title("Administrator required")
+                .set_description("Firewall Manager needs administrator rights to manage Windows Firewall rules.")
+                .show();
+        }
+        return Ok(()); // the elevated copy (if any) took over
     }
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([940.0, 620.0])
-            .with_min_inner_size([760.0, 480.0])
+            .with_inner_size([1000.0, 660.0])
+            .with_min_inner_size([820.0, 520.0])
             .with_title("Firewall Manager")
             .with_icon(egui::IconData {
                 rgba: include_bytes!("../assets/icon.rgba").to_vec(),
@@ -94,9 +119,46 @@ fn main() -> eframe::Result<()> {
     eframe::run_native("Firewall Manager", opts, Box::new(|cc| Ok(Box::new(App::new(cc)))))
 }
 
+fn setup_style(ctx: &egui::Context) {
+    let mut v = egui::Visuals::dark();
+    v.panel_fill = BG;
+    v.window_fill = CARD;
+    v.extreme_bg_color = Color32::from_rgb(15, 18, 25);
+    v.faint_bg_color = Color32::from_rgb(28, 33, 46);
+    v.override_text_color = Some(TEXT);
+    v.selection.bg_fill = ACCENT.linear_multiply(0.55);
+    v.window_corner_radius = 12.into();
+    v.menu_corner_radius = 8.into();
+    v.window_stroke = egui::Stroke::new(1.0_f32, Color32::from_rgb(55, 63, 85));
+    for w in [&mut v.widgets.noninteractive, &mut v.widgets.inactive, &mut v.widgets.hovered, &mut v.widgets.active] {
+        w.corner_radius = 8.into();
+    }
+    v.widgets.inactive.bg_fill = CARD_HI;
+    v.widgets.inactive.weak_bg_fill = CARD_HI;
+    v.widgets.hovered.bg_fill = Color32::from_rgb(54, 63, 88);
+    v.widgets.hovered.weak_bg_fill = Color32::from_rgb(54, 63, 88);
+    v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, Color32::from_rgb(45, 52, 72));
+    ctx.set_visuals(v);
+    ctx.style_mut(|s| {
+        s.spacing.item_spacing = egui::vec2(10.0, 10.0);
+        s.spacing.button_padding = egui::vec2(14.0, 8.0);
+        s.spacing.interact_size.y = 30.0;
+        s.spacing.scroll.bar_width = 8.0;
+        use egui::{FontFamily::Proportional, FontId, TextStyle::*};
+        s.text_styles.insert(Heading, FontId::new(24.0, Proportional));
+        s.text_styles.insert(Body, FontId::new(14.5, Proportional));
+        s.text_styles.insert(Button, FontId::new(14.5, Proportional));
+        s.text_styles.insert(Small, FontId::new(12.0, Proportional));
+    });
+}
+
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        cc.egui_ctx.set_visuals(egui::Visuals::dark());
+        setup_style(&cc.egui_ctx);
+        let icon = {
+            let img = egui::ColorImage::from_rgba_unmultiplied([64, 64], include_bytes!("../assets/icon.rgba"));
+            Some(cc.egui_ctx.load_texture("icon", img, egui::TextureOptions::LINEAR))
+        };
         let (tx, rx) = channel();
         let mut app = App {
             tab: Tab::Folder,
@@ -104,6 +166,8 @@ impl App {
             rx,
             busy: None,
             progress: None,
+            icon,
+            upd: Upd::Checking,
             folder: None,
             scan_files: vec![],
             scan_already: 0,
@@ -117,11 +181,38 @@ impl App {
             list_msg: None,
             confirm_all: false,
         };
-        // Prefetch so the list is ready by the time the tab is opened.
-        app.spawn("Loading rules...", &cc.egui_ctx, |tx| {
-            let _ = tx.send(Msg::Listed(fw::list_blocked()));
-        });
+        app.reload(&cc.egui_ctx);
+        app.check_update(&cc.egui_ctx);
         app
+    }
+
+    fn check_update(&mut self, ctx: &egui::Context) {
+        self.upd = Upd::Checking;
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            update::cleanup();
+            let _ = tx.send(Msg::UpdateChecked(update::check()));
+            ctx.request_repaint();
+        });
+    }
+
+    fn start_update(&mut self, ctx: &egui::Context, u: update::Update) {
+        self.upd = Upd::Installing("Downloading...".into());
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let t2 = tx.clone();
+            let c2 = ctx.clone();
+            let r = update::install(&u, move |d, t| {
+                let pct = if t > 0 { format!("Downloading... {}%", d * 100 / t) } else { "Downloading...".into() };
+                let _ = t2.send(Msg::UpdateProgress(pct));
+                c2.request_repaint();
+            });
+            let _ = tx.send(match r {
+                Ok(()) => Msg::UpdateStarted,
+                Err(e) => Msg::UpdateFailed(e),
+            });
+            ctx.request_repaint();
+        });
     }
 
     fn spawn(&mut self, label: &str, ctx: &egui::Context, f: impl FnOnce(&Sender<Msg>) + Send + 'static) {
@@ -185,6 +276,18 @@ impl App {
     fn poll(&mut self, ctx: &egui::Context) {
         while let Ok(m) = self.rx.try_recv() {
             match m {
+                Msg::UpdateChecked(r) => {
+                    self.upd = match r {
+                        Ok(Some(u)) => Upd::Available(u),
+                        Ok(None) => Upd::UpToDate,
+                        Err(e) => Upd::Failed(e),
+                    }
+                }
+                Msg::UpdateProgress(s) => self.upd = Upd::Installing(s),
+                Msg::UpdateFailed(e) => self.upd = Upd::Failed(e),
+                Msg::UpdateStarted => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close); // the installer takes over
+                }
                 Msg::Progress(d, t) => self.progress = Some((d, t)),
                 Msg::Scanned { files, already, errors } => {
                     self.busy = None;
@@ -194,10 +297,7 @@ impl App {
                 }
                 Msg::Blocked(rep) => {
                     self.busy = None;
-                    let mut log = vec![];
-                    for e in &rep.errors {
-                        log.push((false, e.clone()));
-                    }
+                    let mut log: Vec<(bool, String)> = rep.errors.iter().map(|e| (false, e.clone())).collect();
                     log.push((
                         rep.errors.is_empty(),
                         format!("{} blocked, {} already blocked, {} failed", rep.blocked, rep.skipped, rep.errors.len()),
@@ -217,7 +317,7 @@ impl App {
                     self.busy = None;
                     match r {
                         Ok(v) => {
-                            let keep: std::collections::HashSet<_> = v.iter().map(|p| fw::path_key(&p.path)).collect();
+                            let keep: HashSet<_> = v.iter().map(|p| fw::path_key(&p.path)).collect();
                             self.selected.retain(|s| keep.contains(s));
                             self.blocked = v;
                             self.loaded = true;
@@ -240,11 +340,10 @@ impl App {
                 }
                 Msg::Failed(e) => {
                     self.busy = None;
-                    let l = vec![(false, e)];
                     match self.tab {
-                        Tab::Folder => self.folder_log = l,
-                        Tab::Exe => self.exe_log = l,
-                        Tab::Blocked => self.list_msg = Some((false, l[0].1.clone())),
+                        Tab::Folder => self.folder_log = vec![(false, e)],
+                        Tab::Exe => self.exe_log = vec![(false, e)],
+                        Tab::Blocked => self.list_msg = Some((false, e)),
                     }
                 }
             }
@@ -252,22 +351,75 @@ impl App {
     }
 }
 
+// ---- small widgets ----------------------------------------------------------
+
+fn card<R>(ui: &mut egui::Ui, fill: Color32, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    egui::Frame::new()
+        .fill(fill)
+        .corner_radius(12)
+        .inner_margin(egui::Margin::same(16))
+        .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(45, 52, 72)))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            add(ui)
+        })
+        .inner
+}
+
+/// Explanation box shown at the top of the block pages.
+fn info_box(ui: &mut egui::Ui, title: &str, lines: &[&str]) {
+    egui::Frame::new()
+        .fill(INFO.linear_multiply(0.10))
+        .corner_radius(12)
+        .inner_margin(egui::Margin::same(14))
+        .stroke(egui::Stroke::new(1.0_f32, INFO.linear_multiply(0.45)))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("i").strong().color(INFO).size(15.0));
+                ui.label(RichText::new(title).strong().color(INFO));
+            });
+            for l in lines {
+                ui.label(RichText::new(format!("•  {l}")).color(TEXT));
+            }
+        });
+}
+
+fn page_header(ui: &mut egui::Ui, title: &str, sub: &str) {
+    ui.label(RichText::new(title).heading().strong());
+    ui.label(RichText::new(sub).color(MUTED));
+    ui.add_space(4.0);
+}
+
+fn primary(text: impl Into<String>) -> egui::Button<'static> {
+    egui::Button::new(RichText::new(text.into()).color(Color32::WHITE).strong()).fill(ACCENT)
+}
+
+fn chip(ui: &mut egui::Ui, text: &str, color: Color32) {
+    egui::Frame::new()
+        .fill(color.linear_multiply(0.18))
+        .corner_radius(20)
+        .inner_margin(egui::Margin::symmetric(10, 3))
+        .show(ui, |ui| {
+            ui.label(RichText::new(text).color(color).size(12.5).strong());
+        });
+}
+
 fn log_view(ui: &mut egui::Ui, log: &[(bool, String)]) {
-    egui::ScrollArea::vertical().id_salt("log").max_height(110.0).show(ui, |ui| {
-        for (ok, line) in log {
-            let c = if *ok { Color32::from_rgb(80, 200, 120) } else { Color32::from_rgb(235, 90, 90) };
-            ui.label(RichText::new(line).color(c).monospace().size(12.0));
-        }
+    if log.is_empty() {
+        return;
+    }
+    card(ui, PANEL, |ui| {
+        egui::ScrollArea::vertical().id_salt("log").max_height(100.0).show(ui, |ui| {
+            for (ok, line) in log {
+                ui.label(RichText::new(line).color(if *ok { OK } else { BAD }).monospace().size(12.0));
+            }
+        });
     });
 }
 
-fn badge(ui: &mut egui::Ui, on: bool, yes: &str, no: &str) {
-    let (t, c) = if on {
-        (yes, Color32::from_rgb(80, 200, 120))
-    } else {
-        (no, Color32::from_rgb(140, 140, 140))
-    };
-    ui.label(RichText::new(t).color(c));
+fn path_label(p: &str) -> RichText {
+    RichText::new(p).monospace().size(12.5)
 }
 
 impl eframe::App for App {
@@ -275,7 +427,7 @@ impl eframe::App for App {
         self.poll(ctx);
         let idle = self.busy.is_none();
 
-        // Drag & drop: folder -> scan, exe files -> block list.
+        // Drag & drop: a folder starts a scan, .exe files go to the Block EXE page.
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
         if idle && !dropped.is_empty() {
             if dropped.len() == 1 && dropped[0].is_dir() {
@@ -294,83 +446,186 @@ impl eframe::App for App {
             }
         }
 
-        egui::SidePanel::left("nav").exact_width(170.0).show(ctx, |ui| {
-            ui.add_space(12.0);
-            ui.heading("Firewall Manager");
-            ui.add_space(14.0);
-            let mut tab = self.tab;
-            for (t, label) in [(Tab::Folder, "Block Folder"), (Tab::Exe, "Block EXE"), (Tab::Blocked, "Blocked Programs")] {
-                let text = if t == Tab::Blocked && self.loaded {
-                    format!("{label} ({})", self.blocked.len())
-                } else {
-                    label.to_string()
-                };
-                if ui.selectable_label(tab == t, RichText::new(text).size(15.0)).clicked() {
-                    tab = t;
-                }
-                ui.add_space(2.0);
-            }
-            if tab != self.tab {
-                self.tab = tab;
-                if tab == Tab::Blocked && !self.loaded && idle {
-                    self.reload(ctx);
-                }
-            }
-        });
+        self.sidebar(ctx, idle);
+        self.statusbar(ctx);
 
-        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
-            ui.horizontal(|ui| match (&self.busy, self.progress) {
-                (Some(l), Some((d, t))) => {
-                    ui.spinner();
-                    ui.label(format!("{l} {d}/{t}"));
-                    ui.add(egui::ProgressBar::new(d as f32 / t.max(1) as f32).desired_width(240.0));
-                }
-                (Some(l), None) => {
-                    ui.spinner();
-                    ui.label(l);
-                }
-                _ => {
-                    ui.label("Ready  ·  tip: drop a folder or .exe files onto the window");
-                }
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(BG).inner_margin(egui::Margin::symmetric(26, 20)))
+            .show(ctx, |ui| {
+                self.update_banner(ui, ctx);
+                ui.add_enabled_ui(idle, |ui| match self.tab {
+                    Tab::Folder => self.folder_ui(ui, ctx),
+                    Tab::Exe => self.exe_ui(ui, ctx),
+                    Tab::Blocked => self.blocked_ui(ui, ctx),
+                });
             });
-        });
-
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.add_enabled_ui(idle, |ui| match self.tab {
-                Tab::Folder => self.folder_ui(ui, ctx),
-                Tab::Exe => self.exe_ui(ui, ctx),
-                Tab::Blocked => self.blocked_ui(ui, ctx),
-            });
-        });
     }
 }
 
 impl App {
-    fn folder_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.heading("Block Folder");
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            ui.label(match &self.folder {
-                Some(p) => RichText::new(p.display().to_string()).monospace(),
-                None => RichText::new("No folder selected").weak(),
+    fn sidebar(&mut self, ctx: &egui::Context, idle: bool) {
+        egui::SidePanel::left("nav")
+            .exact_width(210.0)
+            .frame(egui::Frame::new().fill(PANEL).inner_margin(egui::Margin::same(16)))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if let Some(t) = &self.icon {
+                        ui.image((t.id(), egui::vec2(34.0, 34.0)));
+                    }
+                    ui.vertical(|ui| {
+                        ui.add_space(-2.0);
+                        ui.label(RichText::new("Firewall").strong().size(16.0));
+                        ui.label(RichText::new("Manager").strong().size(16.0));
+                    });
+                });
+                ui.add_space(18.0);
+                let items = [
+                    (Tab::Folder, "Block Folder".to_string()),
+                    (Tab::Exe, "Block EXE".to_string()),
+                    (
+                        Tab::Blocked,
+                        if self.loaded { format!("Blocked Programs  ({})", self.blocked.len()) } else { "Blocked Programs".into() },
+                    ),
+                ];
+                let mut next = self.tab;
+                for (t, label) in items {
+                    let sel = self.tab == t;
+                    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 38.0), egui::Sense::click());
+                    let fill = if sel {
+                        ACCENT.linear_multiply(0.22)
+                    } else if resp.hovered() {
+                        CARD
+                    } else {
+                        Color32::TRANSPARENT
+                    };
+                    ui.painter().rect_filled(rect, 8.0, fill);
+                    if sel {
+                        let bar = egui::Rect::from_min_size(rect.left_top() + egui::vec2(0.0, 8.0), egui::vec2(3.0, 22.0));
+                        ui.painter().rect_filled(bar, 2.0, ACCENT);
+                    }
+                    ui.painter().text(
+                        rect.left_center() + egui::vec2(14.0, 0.0),
+                        egui::Align2::LEFT_CENTER,
+                        label,
+                        egui::FontId::proportional(14.5),
+                        if sel { Color32::WHITE } else { TEXT },
+                    );
+                    if resp.clicked() {
+                        next = t;
+                    }
+                }
+                if next != self.tab {
+                    self.tab = next;
+                    if next == Tab::Blocked && !self.loaded && idle {
+                        self.reload(ctx);
+                    }
+                }
+                ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+                    ui.label(RichText::new(format!("v{}", update::CURRENT)).color(MUTED).size(12.0));
+                    let txt = match &self.upd {
+                        Upd::Checking => "Checking for updates...".to_string(),
+                        Upd::UpToDate => "Up to date".to_string(),
+                        Upd::Available(u) => format!("Update {} available", u.version),
+                        Upd::Installing(s) => s.clone(),
+                        Upd::Failed(_) => "Update check failed".to_string(),
+                    };
+                    let r = ui.label(RichText::new(txt).color(MUTED).size(12.0));
+                    if let Upd::Failed(e) = &self.upd {
+                        r.on_hover_text(e);
+                    }
+                });
             });
-            if ui.button("Browse...").clicked() {
+    }
+
+    fn statusbar(&self, ctx: &egui::Context) {
+        egui::TopBottomPanel::bottom("status")
+            .frame(egui::Frame::new().fill(PANEL).inner_margin(egui::Margin::symmetric(16, 8)))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| match (&self.busy, self.progress) {
+                    (Some(l), Some((d, t))) => {
+                        ui.spinner();
+                        ui.label(format!("{l} {d}/{t}"));
+                        ui.add(egui::ProgressBar::new(d as f32 / t.max(1) as f32).desired_width(260.0).fill(ACCENT));
+                    }
+                    (Some(l), None) => {
+                        ui.spinner();
+                        ui.label(l);
+                    }
+                    _ => {
+                        ui.label(RichText::new("Ready   ·   drop a folder or .exe files onto the window").color(MUTED).size(12.5));
+                    }
+                });
+            });
+    }
+
+    fn update_banner(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if let Upd::Available(u) = &self.upd {
+            let u = u.clone();
+            egui::Frame::new()
+                .fill(OK.linear_multiply(0.12))
+                .corner_radius(12)
+                .inner_margin(egui::Margin::same(12))
+                .stroke(egui::Stroke::new(1.0_f32, OK.linear_multiply(0.5)))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(format!("Version {} is available (you have {}).", u.version, update::CURRENT)).color(OK).strong());
+                        if ui.add(primary("Update now")).clicked() {
+                            self.start_update(ctx, u.clone());
+                        }
+                        if !u.notes_url.is_empty() {
+                            ui.hyperlink_to("What's new", &u.notes_url);
+                        }
+                    });
+                });
+            ui.add_space(6.0);
+        }
+    }
+
+    fn folder_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        page_header(ui, "Block Folder", "Cut off every program in a folder from the network in one go.");
+        info_box(
+            ui,
+            "What this does",
+            &[
+                "Scans the chosen folder and all of its subfolders for .exe files.",
+                "Creates two Windows Firewall block rules per program: one for incoming and one for outgoing connections.",
+                "Programs that are already blocked are skipped, so nothing is created twice.",
+                "No file is changed or deleted. You can undo it any time under Blocked Programs.",
+            ],
+        );
+        ui.horizontal(|ui| {
+            if ui.add(primary("Choose folder...")).clicked() {
                 if let Some(d) = rfd::FileDialog::new().pick_folder() {
                     self.scan(ctx, d);
                 }
             }
+            match &self.folder {
+                Some(p) => ui.label(path_label(&p.display().to_string())),
+                None => ui.label(RichText::new("or drop a folder onto the window").color(MUTED)),
+            };
         });
+
         if self.folder.is_some() && !self.scan_files.is_empty() {
-            let new = self.scan_files.len() - self.scan_already;
-            ui.add_space(6.0);
-            ui.label(format!(
-                "{} .exe file(s) found, {} already blocked, {} new",
-                self.scan_files.len(),
-                self.scan_already,
-                new
-            ));
+            let total = self.scan_files.len();
+            let new = total - self.scan_already;
             ui.horizontal(|ui| {
-                if ui.add_enabled(new > 0, egui::Button::new(RichText::new(format!("Block {new} new")).color(Color32::WHITE)).fill(Color32::from_rgb(170, 50, 50))).clicked() {
+                chip(ui, &format!("{total} found"), INFO);
+                chip(ui, &format!("{} already blocked", self.scan_already), MUTED);
+                chip(ui, &format!("{new} new"), if new > 0 { WARN } else { MUTED });
+            });
+            card(ui, PANEL, |ui| {
+                let h = (ui.available_height() - 150.0).max(90.0);
+                egui::ScrollArea::vertical().id_salt("scanlist").max_height(h).auto_shrink([false, true]).show(ui, |ui| {
+                    let root = self.folder.clone().unwrap_or_default();
+                    for f in &self.scan_files {
+                        let rel = f.strip_prefix(&root).unwrap_or(f);
+                        ui.label(path_label(&rel.display().to_string()));
+                    }
+                });
+            });
+            ui.horizontal(|ui| {
+                if ui.add_enabled(new > 0, primary(format!("Block {new} new program(s)"))).clicked() {
                     let files = self.scan_files.clone();
                     self.block(ctx, files);
                 }
@@ -380,68 +635,58 @@ impl App {
                     }
                 }
             });
-            ui.add_space(6.0);
-            let h = (ui.available_height() - 130.0).max(80.0);
-            egui::ScrollArea::vertical().id_salt("scanlist").max_height(h).show(ui, |ui| {
-                let root = self.folder.clone().unwrap_or_default();
-                for f in &self.scan_files {
-                    let rel = f.strip_prefix(&root).unwrap_or(f);
-                    ui.label(RichText::new(rel.display().to_string()).monospace().size(12.0));
-                }
-            });
         } else if self.folder.is_some() && self.busy.is_none() && self.folder_log.is_empty() {
-            ui.add_space(6.0);
-            ui.label("No .exe files found in the selected folder.");
+            ui.label(RichText::new("No .exe files found in this folder.").color(WARN));
         }
-        ui.add_space(6.0);
         log_view(ui, &self.folder_log);
     }
 
     fn exe_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.heading("Block EXE");
-        ui.add_space(8.0);
-        if ui.button("Browse...").clicked() {
-            if let Some(f) = rfd::FileDialog::new().add_filter("Executables", &["exe"]).pick_files() {
-                self.exes = f;
-                self.exe_log.clear();
+        page_header(ui, "Block EXE", "Cut off individual programs from the network.");
+        info_box(
+            ui,
+            "What this does",
+            &[
+                "Creates an incoming and an outgoing Windows Firewall block rule for each chosen program.",
+                "Only that exact file is blocked. A copy or another version of the program in a different folder is not.",
+                "Already blocked programs are skipped. No file is changed. Undo any time under Blocked Programs.",
+            ],
+        );
+        ui.horizontal(|ui| {
+            if ui.add(primary("Choose .exe files...")).clicked() {
+                if let Some(f) = rfd::FileDialog::new().add_filter("Executables", &["exe"]).pick_files() {
+                    self.exes = f;
+                    self.exe_log.clear();
+                }
             }
+            if self.exes.is_empty() {
+                ui.label(RichText::new("or drop .exe files onto the window").color(MUTED));
+            }
+        });
+        if !self.exes.is_empty() {
+            card(ui, PANEL, |ui| {
+                egui::ScrollArea::vertical().id_salt("exelist").max_height(220.0).auto_shrink([false, true]).show(ui, |ui| {
+                    for p in &self.exes {
+                        ui.label(path_label(&p.display().to_string()));
+                    }
+                });
+            });
+            ui.horizontal(|ui| {
+                if ui.add(primary(format!("Block {} program(s)", self.exes.len()))).clicked() {
+                    let f = self.exes.clone();
+                    self.block(ctx, f);
+                }
+                if ui.button("Clear").clicked() {
+                    self.exes.clear();
+                }
+            });
         }
-        ui.add_space(6.0);
-        if self.exes.is_empty() {
-            ui.label(RichText::new("No file selected").weak());
-        }
-        for p in &self.exes {
-            ui.label(RichText::new(p.display().to_string()).monospace().size(12.0));
-        }
-        ui.add_space(6.0);
-        if ui
-            .add_enabled(!self.exes.is_empty(), egui::Button::new(format!("Block {}", self.exes.len())))
-            .clicked()
-        {
-            let f = self.exes.clone();
-            self.block(ctx, f);
-        }
-        ui.add_space(6.0);
         log_view(ui, &self.exe_log);
     }
 
     fn blocked_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.heading("Blocked Programs");
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            ui.label("Filter:");
-            ui.add(egui::TextEdit::singleline(&mut self.filter).desired_width(220.0));
-            if ui.button("Refresh").clicked() {
-                self.reload(ctx);
-            }
-            let lost = self.blocked.iter().filter(|b| !b.active_rules).count();
-            if ui.add_enabled(lost > 0, egui::Button::new(format!("Restore missing rules ({lost})"))).clicked() {
-                self.spawn("Restoring rules...", ctx, |tx| {
-                    let _ = fw::restore_missing();
-                    let _ = tx.send(Msg::Listed(fw::list_blocked()));
-                });
-            }
-        });
+        page_header(ui, "Blocked Programs", "Everything this app has blocked. Rules live in Windows Firewall.");
+
         let f = self.filter.to_lowercase();
         let shown: Vec<usize> = (0..self.blocked.len())
             .filter(|&i| {
@@ -449,43 +694,63 @@ impl App {
                 f.is_empty() || b.name.to_lowercase().contains(&f) || b.path.to_lowercase().contains(&f)
             })
             .collect();
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            if ui.button("Select shown").clicked() {
-                for &i in &shown {
-                    self.selected.insert(fw::path_key(&self.blocked[i].path));
+        let lost = self.blocked.iter().filter(|b| !b.active_rules).count();
+        let missing = self.blocked.iter().filter(|b| !b.exists).count();
+
+        card(ui, PANEL, |ui| {
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut self.filter).hint_text("Search name or path...").desired_width(260.0));
+                if ui.button("Refresh").clicked() {
+                    self.reload(ctx);
                 }
-            }
-            if ui.button("Select none").clicked() {
-                self.selected.clear();
-            }
-            let missing = self.blocked.iter().filter(|b| !b.exists).count();
-            if ui.add_enabled(missing > 0, egui::Button::new(format!("Select missing ({missing})"))).clicked() {
-                self.selected = self.blocked.iter().filter(|b| !b.exists).map(|b| fw::path_key(&b.path)).collect();
-            }
-            let n = self.selected.len();
-            if ui.add_enabled(n > 0, egui::Button::new(format!("Remove selected ({n})"))).clicked() {
-                let paths: Vec<String> = self
-                    .blocked
-                    .iter()
-                    .filter(|b| self.selected.contains(&fw::path_key(&b.path)))
-                    .map(|b| b.path.clone())
-                    .collect();
-                self.remove(ctx, Some(paths));
-            }
-            if ui.add_enabled(!self.blocked.is_empty(), egui::Button::new("Remove all")).clicked() {
-                self.confirm_all = true;
+                if lost > 0 && ui.button(format!("Restore {lost} missing rule(s)")).clicked() {
+                    self.spawn("Restoring rules...", ctx, |tx| {
+                        let _ = fw::restore_missing();
+                        let _ = tx.send(Msg::Listed(fw::list_blocked()));
+                    });
+                }
+            });
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Select shown").clicked() {
+                    for &i in &shown {
+                        self.selected.insert(fw::path_key(&self.blocked[i].path));
+                    }
+                }
+                if ui.button("Select none").clicked() {
+                    self.selected.clear();
+                }
+                if ui.add_enabled(missing > 0, egui::Button::new(format!("Select deleted files ({missing})"))).clicked() {
+                    self.selected = self.blocked.iter().filter(|b| !b.exists).map(|b| fw::path_key(&b.path)).collect();
+                }
+                ui.add_space(12.0);
+                let n = self.selected.len();
+                if ui.add_enabled(n > 0, primary(format!("Remove selected ({n})"))).clicked() {
+                    let paths: Vec<String> = self
+                        .blocked
+                        .iter()
+                        .filter(|b| self.selected.contains(&fw::path_key(&b.path)))
+                        .map(|b| b.path.clone())
+                        .collect();
+                    self.remove(ctx, Some(paths));
+                }
+                if ui.add_enabled(!self.blocked.is_empty(), egui::Button::new("Remove all")).clicked() {
+                    self.confirm_all = true;
+                }
+            });
+            if let Some((ok, m)) = &self.list_msg {
+                ui.label(RichText::new(m).color(if *ok { OK } else { BAD }));
             }
         });
+
         if self.confirm_all {
             egui::Window::new("Remove all rules?")
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
-                    ui.label("Remove ALL firewall rules created by this tool?");
+                    ui.label("This removes every firewall rule created by Firewall Manager.\nThe blocked programs will be able to use the network again.");
                     ui.horizontal(|ui| {
-                        if ui.button("Remove all").clicked() {
+                        if ui.add(primary("Remove all")).clicked() {
                             self.confirm_all = false;
                             self.remove(ctx, None);
                         }
@@ -495,46 +760,80 @@ impl App {
                     });
                 });
         }
-        if let Some((ok, m)) = &self.list_msg {
-            let c = if *ok { Color32::from_rgb(80, 200, 120) } else { Color32::from_rgb(235, 90, 90) };
-            ui.label(RichText::new(m).color(c));
-        }
-        ui.add_space(4.0);
+
         if self.blocked.is_empty() {
-            ui.label(RichText::new(if self.loaded { "No rules created by this tool." } else { "Loading..." }).weak());
+            ui.add_space(20.0);
+            ui.label(RichText::new(if self.loaded { "Nothing is blocked yet." } else { "Loading..." }).color(MUTED));
             return;
         }
-        // Virtualised table: only visible rows are laid out, so thousands of rules stay smooth.
-        let row_h = 22.0;
+
+        // Column header
+        ui.horizontal(|ui| {
+            ui.add_space(40.0);
+            for (w, t) in [(204.0, "PROGRAM"), (104.0, "DIRECTION"), (104.0, "STATE")] {
+                ui.add_sized([w, 16.0], egui::Label::new(RichText::new(t).color(MUTED).size(11.5).strong()));
+            }
+            ui.label(RichText::new("PATH").color(MUTED).size(11.5).strong());
+        });
+
+        let row_h = 34.0;
         egui::ScrollArea::vertical().auto_shrink([false, false]).show_rows(ui, row_h, shown.len(), |ui, range| {
-            egui::Grid::new("blocked").striped(true).num_columns(6).min_row_height(row_h).show(ui, |ui| {
-                for &i in &shown[range] {
-                    let b = &self.blocked[i];
-                    let key = fw::path_key(&b.path);
-                    let mut sel = self.selected.contains(&key);
-                    if ui.checkbox(&mut sel, "").changed() {
-                        if sel {
-                            self.selected.insert(key);
-                        } else {
-                            self.selected.remove(&key);
-                        }
-                    }
-                    ui.label(RichText::new(&b.name).strong());
-                    badge(ui, b.inbound, "In", "–");
-                    badge(ui, b.outbound, "Out", "–");
-                    if b.active_rules {
-                        badge(ui, b.enabled, "Active", "Inactive");
+            for &i in &shown[range] {
+                let b = &self.blocked[i];
+                let key = fw::path_key(&b.path);
+                let sel = self.selected.contains(&key);
+                let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), row_h - 4.0), egui::Sense::click());
+                let fill = if sel {
+                    ACCENT.linear_multiply(0.16)
+                } else if resp.hovered() {
+                    CARD_HI
+                } else {
+                    CARD
+                };
+                ui.painter().rect_filled(rect, 8.0, fill);
+                if resp.clicked() {
+                    if sel {
+                        self.selected.remove(&key);
                     } else {
-                        ui.label(RichText::new("Not in firewall").color(Color32::from_rgb(230, 170, 60)));
+                        self.selected.insert(key);
                     }
-                    let mut path = RichText::new(&b.path).monospace().size(11.0);
-                    if !b.exists {
-                        path = path.color(Color32::from_rgb(230, 170, 60));
-                    }
-                    ui.label(path).on_hover_text(if b.exists { &b.path } else { "File no longer exists" });
-                    ui.end_row();
                 }
-            });
+                let mut rui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(rect.shrink2(egui::vec2(10.0, 0.0)))
+                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                );
+                let mut c = sel;
+                rui.add_enabled(false, egui::Checkbox::without_text(&mut c));
+                rui.add_space(6.0);
+                rui.add_sized([204.0, 20.0], egui::Label::new(RichText::new(&b.name).strong()).truncate());
+                let dir = match (b.inbound, b.outbound) {
+                    (true, true) => ("In + Out", OK),
+                    (true, false) => ("In only", WARN),
+                    (false, true) => ("Out only", WARN),
+                    _ => ("none", MUTED),
+                };
+                rui.scope(|ui| {
+                    ui.set_width(104.0);
+                    chip(ui, dir.0, dir.1);
+                });
+                rui.scope(|ui| {
+                    ui.set_width(104.0);
+                    if !b.active_rules {
+                        chip(ui, "Not in firewall", WARN);
+                    } else if b.enabled {
+                        chip(ui, "Active", OK);
+                    } else {
+                        chip(ui, "Disabled", MUTED);
+                    }
+                });
+                let mut path = RichText::new(&b.path).monospace().size(11.5).color(if b.exists { MUTED } else { WARN });
+                if !b.exists {
+                    path = path.strikethrough();
+                }
+                rui.add(egui::Label::new(path).truncate())
+                    .on_hover_text(if b.exists { b.path.as_str() } else { "File no longer exists" });
+            }
         });
     }
 }

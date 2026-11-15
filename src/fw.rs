@@ -160,7 +160,7 @@ fn valid_entry(l: &str) -> bool {
 /// Store folder under %ProgramFiles%, where only administrators can create or change anything
 /// (inherited default ACL), so no user-controlled folder, junction or file can pre-exist.
 /// No ACLs are rewritten. Reparse points are refused.
-fn secure_dir() -> Option<PathBuf> {
+pub fn secure_dir() -> Option<PathBuf> {
     use std::os::windows::fs::MetadataExt;
     use windows::Win32::System::Com::CoTaskMemFree;
     use windows::Win32::UI::Shell::{FOLDERID_ProgramFiles, SHGetKnownFolderPath, KF_FLAG_DEFAULT};

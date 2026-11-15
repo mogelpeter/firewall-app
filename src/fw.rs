@@ -146,11 +146,19 @@ fn our_rules(rules: &INetFwRules) -> Result<Vec<RawRule>> {
 
 // ---- persistent list --------------------------------------------------------
 // The firewall is the source of truth, but we also remember every blocked program in
-// %APPDATA%\FirewallManagerlocked.txt so the list survives updates, reinstalls and
+// %ProgramData%FirewallManagerblocked.txt (not writable by non-elevated processes) so the list survives updates, reinstalls and
 // rules that get wiped, and can be restored.
 
 fn store_file() -> Option<PathBuf> {
-    std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join("FirewallManager").join("blocked.txt"))
+    std::env::var_os("ProgramData").map(|a| PathBuf::from(a).join("FirewallManager").join("blocked.txt"))
+}
+
+/// Only absolute `.exe` paths are accepted from the saved list.
+fn valid_entry(l: &str) -> bool {
+    let p = Path::new(l);
+    !l.is_empty()
+        && p.is_absolute()
+        && p.extension().map(|e| e.eq_ignore_ascii_case("exe")).unwrap_or(false)
 }
 
 fn store_load() -> Vec<String> {
@@ -160,7 +168,7 @@ fn store_load() -> Vec<String> {
         .unwrap_or_default()
         .lines()
         .map(|l| l.trim())
-        .filter(|l| !l.is_empty() && seen.insert(path_key(l)))
+        .filter(|l| valid_entry(l) && seen.insert(path_key(l)))
         .map(String::from)
         .collect()
 }
@@ -217,7 +225,7 @@ pub fn restore_missing() -> Result<usize> {
     for p in store_load() {
         for inbound in [true, false] {
             let k = (path_key(&p), inbound);
-            if !have.contains(&k) && add_rule(&rules, &p, inbound).is_ok() {
+            if !have.contains(&k) && Path::new(&p).is_file() && add_rule(&rules, &p, inbound).is_ok() {
                 have.insert(k);
                 n += 1;
             }

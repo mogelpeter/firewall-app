@@ -114,7 +114,6 @@ impl App {
         };
         // Prefetch so the list is ready by the time the tab is opened.
         app.spawn("Loading rules...", &cc.egui_ctx, |tx| {
-            let _ = fw::restore_missing();
             let _ = tx.send(Msg::Listed(fw::list_blocked()));
         });
         app

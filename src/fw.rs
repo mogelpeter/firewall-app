@@ -162,8 +162,16 @@ fn valid_entry(l: &str) -> bool {
 /// No ACLs are rewritten. Reparse points are refused.
 fn secure_dir() -> Option<PathBuf> {
     use std::os::windows::fs::MetadataExt;
-    let root = std::env::var_os("ProgramW6432").or_else(|| std::env::var_os("ProgramFiles"))?;
-    let d = PathBuf::from(root).join("FirewallManager");
+    use windows::Win32::System::Com::CoTaskMemFree;
+    use windows::Win32::UI::Shell::{FOLDERID_ProgramFiles, SHGetKnownFolderPath, KF_FLAG_DEFAULT};
+    // Known-folder API instead of environment variables (user environment can be overridden).
+    let root = unsafe {
+        let p = SHGetKnownFolderPath(&FOLDERID_ProgramFiles, KF_FLAG_DEFAULT, None).ok()?;
+        let s = p.to_string().ok();
+        CoTaskMemFree(Some(p.as_ptr() as *const _));
+        PathBuf::from(s?)
+    };
+    let d = root.join("FirewallManager");
     std::fs::create_dir_all(&d).ok()?;
     const REPARSE: u32 = 0x400;
     if std::fs::symlink_metadata(&d).ok()?.file_attributes() & REPARSE != 0 {
@@ -422,6 +430,15 @@ mod tests {
     fn rule_name_is_case_insensitive_and_sanitised() {
         assert_eq!(rule_name(r"C:\X\My App.exe", true), rule_name(r"c:\x\My App.EXE", true));
         assert!(rule_name(r"C:\X\My App!.exe", true).starts_with("PSFirewallBlock_My_App__"));
+    }
+
+    #[test]
+    fn store_dir_is_program_files() {
+        // The folder exists after the first elevated run; skip when it was never created.
+        if let Some(d) = secure_dir() {
+            assert!(d.ends_with("FirewallManager"));
+            assert!(d.to_string_lossy().to_lowercase().contains("program files"), "{d:?}");
+        }
     }
 
     #[test]

@@ -146,12 +146,8 @@ fn our_rules(rules: &INetFwRules) -> Result<Vec<RawRule>> {
 
 // ---- persistent list --------------------------------------------------------
 // The firewall is the source of truth, but we also remember every blocked program in
-// %ProgramData%FirewallManagerblocked.txt (not writable by non-elevated processes) so the list survives updates, reinstalls and
+// %ProgramFiles%\FirewallManager\blocked.txt (admin-only folder) so the list survives updates, reinstalls and
 // rules that get wiped, and can be restored.
-
-fn store_file() -> Option<PathBuf> {
-    std::env::var_os("ProgramData").map(|a| PathBuf::from(a).join("FirewallManager").join("blocked.txt"))
-}
 
 /// Only absolute `.exe` paths are accepted from the saved list.
 fn valid_entry(l: &str) -> bool {
@@ -161,53 +157,29 @@ fn valid_entry(l: &str) -> bool {
         && p.extension().map(|e| e.eq_ignore_ascii_case("exe")).unwrap_or(false)
 }
 
-/// Creates the store folder and locks it down: owner Administrators, no inheritance,
-/// SYSTEM + Administrators full control, Users read-only. Refuses reparse points.
-/// Returns false (store disabled) if anything fails. Runs once per process.
+/// Store folder under %ProgramFiles%, where only administrators can create or change anything
+/// (inherited default ACL), so no user-controlled folder, junction or file can pre-exist.
+/// No ACLs are rewritten. Reparse points are refused.
 fn secure_dir() -> Option<PathBuf> {
     use std::os::windows::fs::MetadataExt;
-    use std::os::windows::process::CommandExt;
-    use std::sync::OnceLock;
-    static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
-    DIR.get_or_init(|| {
-        let d = store_file()?.parent()?.to_path_buf();
-        std::fs::create_dir_all(&d).ok()?;
-        const REPARSE: u32 = 0x400;
-        if std::fs::symlink_metadata(&d).ok()?.file_attributes() & REPARSE != 0 {
-            return None;
-        }
-        let icacls = |args: &[&str]| {
-            std::process::Command::new("icacls")
-                .arg(&d)
-                .args(args)
-                .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false)
-        };
-        let ok = icacls(&["/setowner", "*S-1-5-32-544", "/T", "/C", "/Q"])
-            && icacls(&[
-                "/inheritance:r",
-                "/grant:r",
-                "*S-1-5-18:(OI)(CI)F",
-                "*S-1-5-32-544:(OI)(CI)F",
-                "*S-1-5-32-545:(OI)(CI)RX",
-                "/T",
-                "/C",
-                "/Q",
-            ]);
-        ok.then_some(d)
-    })
-    .clone()
+    let root = std::env::var_os("ProgramW6432").or_else(|| std::env::var_os("ProgramFiles"))?;
+    let d = PathBuf::from(root).join("FirewallManager");
+    std::fs::create_dir_all(&d).ok()?;
+    const REPARSE: u32 = 0x400;
+    if std::fs::symlink_metadata(&d).ok()?.file_attributes() & REPARSE != 0 {
+        return None;
+    }
+    Some(d)
 }
 
 fn store_load() -> Vec<String> {
     let Some(d) = secure_dir() else { return vec![] };
-    let f = d.join("blocked.txt");
+    // blocked.bak is the previous good copy, used if blocked.txt is missing or damaged
+    let text = std::fs::read_to_string(d.join("blocked.txt"))
+        .or_else(|_| std::fs::read_to_string(d.join("blocked.bak")))
+        .unwrap_or_default();
     let mut seen = HashSet::new();
-    std::fs::read_to_string(f)
-        .unwrap_or_default()
-        .lines()
+    text.lines()
         .map(|l| l.trim())
         .filter(|l| valid_entry(l) && seen.insert(path_key(l)))
         .map(String::from)
@@ -216,10 +188,12 @@ fn store_load() -> Vec<String> {
 
 fn store_save(paths: &[String]) {
     let Some(d) = secure_dir() else { return };
-    let f = d.join("blocked.txt");
-    let tmp = d.join("blocked.tmp");
+    let (f, bak, tmp) = (d.join("blocked.txt"), d.join("blocked.bak"), d.join("blocked.tmp"));
     if std::fs::write(&tmp, paths.join("
 ")).is_ok() {
+        if f.is_file() {
+            let _ = std::fs::copy(&f, &bak);
+        }
         let _ = std::fs::rename(&tmp, &f);
     }
 }

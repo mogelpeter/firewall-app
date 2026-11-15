@@ -83,6 +83,11 @@ fn main() -> eframe::Result<()> {
             .with_inner_size([940.0, 620.0])
             .with_min_inner_size([760.0, 480.0])
             .with_title("Firewall Manager")
+            .with_icon(egui::IconData {
+                rgba: include_bytes!("../assets/icon.rgba").to_vec(),
+                width: 64,
+                height: 64,
+            })
             .with_drag_and_drop(true),
         ..Default::default()
     };

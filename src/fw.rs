@@ -7,7 +7,8 @@ use windows::core::{Interface, BSTR};
 use windows::Win32::Foundation::{S_OK, VARIANT_TRUE};
 use windows::Win32::NetworkManagement::WindowsFirewall::{
     INetFwPolicy2, INetFwRule, INetFwRules, NetFwPolicy2, NetFwRule, NET_FW_ACTION_BLOCK,
-    NET_FW_PROFILE2_ALL, NET_FW_RULE_DIR_IN, NET_FW_RULE_DIR_OUT,
+    NET_FW_IP_PROTOCOL_ANY, NET_FW_PROFILE2_ALL, NET_FW_PROFILE2_DOMAIN, NET_FW_PROFILE2_PRIVATE,
+    NET_FW_PROFILE2_PUBLIC, NET_FW_RULE_DIR_IN, NET_FW_RULE_DIR_OUT,
 };
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, IDispatch, CLSCTX_INPROC_SERVER,
@@ -69,9 +70,69 @@ pub struct RemoveReport {
     pub errors: Vec<String>,
 }
 
-/// Case-insensitive key for comparing Windows paths.
+/// Case-insensitive key for comparing Windows paths. `%VAR%` parts (used by many firewall rules)
+/// are expanded, so both spellings of a path compare equal.
 pub fn path_key(p: &str) -> String {
-    p.trim().replace('/', "\\").to_lowercase()
+    expand_env(p.trim()).replace('/', "\\").to_lowercase()
+}
+
+fn expand_env(p: &str) -> String {
+    let mut out = String::new();
+    let mut rest = p;
+    while let Some(a) = rest.find('%') {
+        let Some(len) = rest[a + 1..].find('%') else { break };
+        match std::env::var(&rest[a + 1..a + 1 + len]) {
+            Ok(v) => {
+                out.push_str(&rest[..a]);
+                out.push_str(&v);
+                rest = &rest[a + len + 2..];
+            }
+            Err(_) => {
+                out.push_str(&rest[..a + 1]);
+                rest = &rest[a + 1..];
+            }
+        }
+    }
+    out + rest
+}
+
+/// The folder a program lives in, used to group its executables: the first folder below a known
+/// install location (Program Files, AppData, Steam library, ...), otherwise the folder holding
+/// the exe, skipping technical subfolders such as `bin\x64`.
+pub fn program_dir(path: &str) -> String {
+    const HOLDERS: [&str; 6] = ["program files", "program files (x86)", "programdata", "games", "xboxgames", "epic games"];
+    const TECHNICAL: [&str; 8] = ["bin", "bin32", "bin64", "binaries", "win32", "win64", "x64", "x86"];
+    let norm = path.replace('/', "\\");
+    let mut dirs: Vec<&str> = norm.split('\\').collect();
+    dirs.pop(); // file name
+    let is = |i: usize, name: &str| dirs.get(i).is_some_and(|d| d.eq_ignore_ascii_case(name));
+    let mut end = None;
+    for i in 0..dirs.len() {
+        let skip = if is(i, "steamapps") && is(i + 1, "common") {
+            2
+        } else if is(i, "appdata") {
+            if is(i + 2, "programs") { 3 } else { 2 }
+        } else if HOLDERS.iter().any(|h| is(i, h)) {
+            1
+        } else {
+            continue;
+        };
+        let mut j = i + skip;
+        if is(j, "common files") {
+            j += 1;
+        }
+        if j < dirs.len() {
+            end = Some(j + 1); // a deeper match wins (Steam inside Program Files)
+        }
+    }
+    let end = end.unwrap_or_else(|| {
+        let mut e = dirs.len();
+        while e > 1 && TECHNICAL.iter().any(|t| is(e - 1, t)) {
+            e -= 1;
+        }
+        e
+    });
+    dirs[..end].join("\\")
 }
 
 fn fnv1a(s: &str) -> u64 {
@@ -105,14 +166,59 @@ struct RawRule {
     app: String,
     inbound: bool,
     enabled: bool,
+    /// created by this app
+    ours: bool,
+}
+
+/// Which (path key, inbound) pairs already have a block rule; the value says whether one is enabled.
+pub type Coverage = HashMap<(String, bool), bool>;
+
+fn coverage_of(live: &[RawRule]) -> Coverage {
+    let mut c = Coverage::new();
+    for r in live {
+        *c.entry((path_key(&r.app), r.inbound)).or_default() |= r.enabled;
+    }
+    c
+}
+
+/// True when the program already has a block rule in both directions.
+pub fn is_blocked(c: &Coverage, path: &str) -> bool {
+    let key = path_key(path);
+    [true, false].iter().all(|&inbound| c.contains_key(&(key.clone(), inbound)))
 }
 
 fn policy() -> Result<INetFwPolicy2> {
     unsafe { CoCreateInstance(&NetFwPolicy2, None, CLSCTX_INPROC_SERVER) }.map_err(err)
 }
 
-/// Reads every rule that carries our prefix. Only fetches the properties we need.
-fn our_rules(rules: &INetFwRules) -> Result<Vec<RawRule>> {
+/// True when a rule made elsewhere blocks the program completely: enabled, every profile,
+/// protocol, port, address and interface type, and not limited to a service.
+fn blocks_everything(rule: &INetFwRule) -> bool {
+    let any = |v: windows::core::Result<BSTR>| {
+        v.map(|s| {
+            let s = s.to_string();
+            s.is_empty() || s == "*" || s.eq_ignore_ascii_case("all")
+        })
+        .unwrap_or(false)
+    };
+    let all = NET_FW_PROFILE2_DOMAIN.0 | NET_FW_PROFILE2_PRIVATE.0 | NET_FW_PROFILE2_PUBLIC.0;
+    unsafe {
+        rule.Action().is_ok_and(|a| a == NET_FW_ACTION_BLOCK)
+            && rule.Enabled().is_ok_and(|b| b == VARIANT_TRUE)
+            && rule.Protocol().is_ok_and(|p| p == NET_FW_IP_PROTOCOL_ANY.0)
+            && rule.Profiles().is_ok_and(|p| p & all == all)
+            && any(rule.LocalPorts())
+            && any(rule.RemotePorts())
+            && any(rule.LocalAddresses())
+            && any(rule.RemoteAddresses())
+            && any(rule.InterfaceTypes())
+            && any(rule.ServiceName())
+    }
+}
+
+/// Reads every rule that carries our prefix, plus rules from other sources that already block a
+/// program completely.
+fn read_rules(rules: &INetFwRules) -> Result<Vec<RawRule>> {
     let unk = unsafe { rules._NewEnum() }.map_err(err)?;
     let en: IEnumVARIANT = unk.cast().map_err(err)?;
     let mut out = Vec::new();
@@ -128,13 +234,17 @@ fn our_rules(rules: &INetFwRules) -> Result<Vec<RawRule>> {
             let Ok(rule) = disp.cast::<INetFwRule>() else { continue };
             let Ok(name) = (unsafe { rule.Name() }) else { continue };
             let name = name.to_string();
-            if !name.starts_with(RULE_PREFIX) {
+            let ours = name.starts_with(RULE_PREFIX);
+            if !ours && !blocks_everything(&rule) {
                 continue;
             }
             let app = unsafe { rule.ApplicationName() }.map(|b| b.to_string()).unwrap_or_default();
+            if !ours && app.is_empty() {
+                continue;
+            }
             let inbound = unsafe { rule.Direction() }.map(|d| d == NET_FW_RULE_DIR_IN).unwrap_or(false);
             let enabled = unsafe { rule.Enabled() }.map(|b| b == VARIANT_TRUE).unwrap_or(false);
-            out.push(RawRule { name, app, inbound, enabled });
+            out.push(RawRule { name, app, inbound, enabled, ours });
         }
         if hr != S_OK {
             break;
@@ -239,15 +349,16 @@ pub fn restore_missing() -> Result<usize> {
     let _com = ComGuard::new();
     let pol = policy()?;
     let rules = unsafe { pol.Rules() }.map_err(err)?;
-    let live = our_rules(&rules)?;
-    let mut have: HashSet<(String, bool)> = live.iter().map(|r| (path_key(&r.app), r.inbound)).collect();
-    store_add(&live.iter().map(|r| r.app.clone()).collect::<Vec<_>>()); // adopt rules from older versions
+    let live = read_rules(&rules)?;
+    let mut have = coverage_of(&live);
+    // adopt rules from older versions
+    store_add(&live.iter().filter(|r| r.ours).map(|r| r.app.clone()).collect::<Vec<_>>());
     let mut n = 0;
     for p in store_load() {
         for inbound in [true, false] {
             let k = (path_key(&p), inbound);
-            if !have.contains(&k) && Path::new(&p).is_file() && add_rule(&rules, &p, inbound).is_ok() {
-                have.insert(k);
+            if !have.contains_key(&k) && Path::new(&p).is_file() && add_rule(&rules, &p, inbound).is_ok() {
+                have.insert(k, true);
                 n += 1;
             }
         }
@@ -261,7 +372,9 @@ pub fn list_blocked() -> Result<Vec<BlockedProgram>> {
     let pol = policy()?;
     let rules = unsafe { pol.Rules() }.map_err(err)?;
     let mut map: HashMap<String, BlockedProgram> = HashMap::new();
-    for r in our_rules(&rules)? {
+    let all = read_rules(&rules)?;
+    let covered = coverage_of(&all);
+    for r in all.iter().filter(|r| r.ours) {
         let key = path_key(&r.app);
         let e = map.entry(key).or_insert_with(|| BlockedProgram {
             name: Path::new(&r.app)
@@ -296,21 +409,31 @@ pub fn list_blocked() -> Result<Vec<BlockedProgram>> {
             active_rules: false,
         });
     }
+    // rules made elsewhere count too: they are the reason no second rule is created
+    for (key, b) in &mut map {
+        for inbound in [true, false] {
+            if let Some(&enabled) = covered.get(&(key.clone(), inbound)) {
+                if inbound {
+                    b.inbound = true;
+                } else {
+                    b.outbound = true;
+                }
+                b.enabled |= enabled;
+            }
+        }
+        b.active_rules |= b.inbound && b.outbound;
+    }
     let mut v: Vec<_> = map.into_values().collect();
     v.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()).then(a.path.cmp(&b.path)));
     Ok(v)
 }
 
-fn blocked_keys(rules: &INetFwRules) -> Result<HashSet<String>> {
-    Ok(our_rules(rules)?.into_iter().map(|r| path_key(&r.app)).collect())
-}
-
-/// Set of lowercase paths that already have a rule from this tool.
-pub fn blocked_set() -> Result<HashSet<String>> {
+/// Read-only scan of the firewall for existing block rules, from this app or any other.
+pub fn coverage() -> Result<Coverage> {
     let _com = ComGuard::new();
     let pol = policy()?;
     let rules = unsafe { pol.Rules() }.map_err(err)?;
-    blocked_keys(&rules)
+    Ok(coverage_of(&read_rules(&rules)?))
 }
 
 fn add_rule(rules: &INetFwRules, path: &str, inbound: bool) -> Result<()> {
@@ -328,24 +451,26 @@ fn add_rule(rules: &INetFwRules, path: &str, inbound: bool) -> Result<()> {
     }
 }
 
-/// Blocks each program in both directions. Already-blocked programs are skipped (no duplicates).
+/// Blocks each program in both directions. Only missing directions are created, so a program that
+/// already has a block rule never gets a second one.
 /// `progress(done, total)` is called after every file.
 pub fn block_files(files: &[PathBuf], mut progress: impl FnMut(usize, usize)) -> Result<BlockReport> {
     let _com = ComGuard::new();
     let pol = policy()?;
     let rules = unsafe { pol.Rules() }.map_err(err)?;
-    let mut have = blocked_keys(&rules)?;
+    let mut have = coverage_of(&read_rules(&rules)?);
     let mut rep = BlockReport::default();
     for (i, f) in files.iter().enumerate() {
         let p = f.to_string_lossy().into_owned();
         let key = path_key(&p);
-        if have.contains(&key) {
+        let missing: Vec<bool> = [true, false].into_iter().filter(|&d| !have.contains_key(&(key.clone(), d))).collect();
+        if missing.is_empty() {
             rep.skipped += 1;
         } else {
-            match add_rule(&rules, &p, true).and_then(|_| add_rule(&rules, &p, false)) {
+            match missing.iter().try_for_each(|&inbound| add_rule(&rules, &p, inbound)) {
                 Ok(()) => {
                     store_add(&[p.clone()]);
-                    have.insert(key);
+                    have.extend(missing.iter().map(|&d| ((key.clone(), d), true)));
                     rep.blocked += 1;
                 }
                 Err(e) => rep.errors.push(format!("{p}: {e}")),
@@ -362,7 +487,8 @@ fn remove_where(pred: impl Fn(&RawRule) -> bool) -> Result<RemoveReport> {
     let rules = unsafe { pol.Rules() }.map_err(err)?;
     let mut rep = RemoveReport::default();
     // Rules.Remove deletes by name; one call per matching rule instance.
-    for r in our_rules(&rules)?.into_iter().filter(|r| pred(r)) {
+    // Only this app's rules are ever removed.
+    for r in read_rules(&rules)?.into_iter().filter(|r| r.ours && pred(r)) {
         match unsafe { rules.Remove(&BSTR::from(r.name.as_str())) } {
             Ok(()) => rep.removed += 1,
             Err(e) => rep.errors.push(format!("{}: {e}", r.name)),
@@ -444,6 +570,38 @@ mod tests {
     #[test]
     fn path_key_normalises() {
         assert_eq!(path_key("C:/Foo/Bar.EXE "), r"c:\foo\bar.exe");
+    }
+
+    #[test]
+    fn path_key_expands_environment_variables() {
+        let root = std::env::var("SystemRoot").unwrap();
+        assert_eq!(path_key(r"%SystemRoot%\a.exe"), path_key(&format!(r"{root}\a.exe")));
+        assert_eq!(path_key(r"C:\100%\%nope_fwm%\a.exe"), r"c:\100%\%nope_fwm%\a.exe");
+    }
+
+    #[test]
+    fn blocked_needs_both_directions() {
+        let mut c = Coverage::new();
+        c.insert((path_key(r"C:\a.exe"), true), true);
+        assert!(!is_blocked(&c, r"C:\A.exe"));
+        c.insert((path_key(r"C:\a.exe"), false), false);
+        assert!(is_blocked(&c, r"C:\A.exe"));
+    }
+
+    #[test]
+    fn program_dir_groups_by_install_folder() {
+        for (exe, dir) in [
+            (r"C:\Program Files\Adobe\Reader\bin\a.exe", r"C:\Program Files\Adobe"),
+            (r"C:\Program Files\Common Files\Adobe\x\a.exe", r"C:\Program Files\Common Files\Adobe"),
+            (r"C:\Program Files (x86)\Steam\steamapps\common\Doom\x64\a.exe", r"C:\Program Files (x86)\Steam\steamapps\common\Doom"),
+            (r"C:\Users\u\AppData\Local\Programs\Tool\a.exe", r"C:\Users\u\AppData\Local\Programs\Tool"),
+            (r"C:\Users\u\AppData\Roaming\App\sub\a.exe", r"C:\Users\u\AppData\Roaming\App"),
+            (r"D:\Stuff\Thing\bin\x64\a.exe", r"D:\Stuff\Thing"),
+            (r"C:\Program Files\a.exe", r"C:\Program Files"),
+            (r"D:\a.exe", "D:"),
+        ] {
+            assert_eq!(program_dir(exe), dir, "{exe}");
+        }
     }
 
     #[test]

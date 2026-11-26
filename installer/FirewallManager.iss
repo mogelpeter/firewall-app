@@ -1,4 +1,4 @@
-; Inno Setup script. Build: ISCC /DAppVersion=3.1.0 installer\FirewallManager.iss  (after cargo build --release)
+; Inno Setup script. Build: ISCC /DAppVersion=3.2.0 installer\FirewallManager.iss  (after cargo build --release)
 #ifndef AppVersion
   #define AppVersion "0.0.0"
 #endif
@@ -41,6 +41,26 @@ Type: filesandordirs; Name: "{app}\update"
 Type: files; Name: "{autodesktop}\Firewall Manager.lnk"
 
 [Code]
+{ With "close to tray" a close request only hides the window, so end a running copy outright. }
+procedure StopApp;
+var
+  Code: Integer;
+begin
+  Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM FirewallManager.exe', '', SW_HIDE, ewWaitUntilTerminated, Code);
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  StopApp;
+  Result := '';
+end;
+
+function InitializeUninstall: Boolean;
+begin
+  StopApp;
+  Result := True;
+end;
+
 { After the files are installed, ask whether to put a shortcut on the desktop.
   Silent runs (the updater) never ask, and keep a shortcut that already exists. }
 procedure CurStepChanged(CurStep: TSetupStep);

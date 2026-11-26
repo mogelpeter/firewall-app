@@ -1,11 +1,15 @@
 #![windows_subsystem = "windows"]
 
 mod fw;
+mod tray;
 mod update;
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use eframe::egui::{self, Color32, RichText};
 use fw::{BlockReport, BlockedProgram, RemoveReport};
@@ -24,11 +28,15 @@ const BAD: Color32 = Color32::from_rgb(240, 100, 100);
 const TEXT: Color32 = Color32::from_rgb(250, 248, 255);
 const MUTED: Color32 = Color32::from_rgb(166, 154, 196);
 
+/// How often the firewall is re-checked in the background for block rules.
+const SCAN_EVERY: Duration = Duration::from_secs(15);
+
 #[derive(PartialEq, Clone, Copy)]
 enum Tab {
     Folder,
     Exe,
     Blocked,
+    Settings,
 }
 
 enum Upd {
@@ -40,7 +48,8 @@ enum Upd {
 }
 
 enum Msg {
-    Scanned { files: Vec<PathBuf>, already: usize, errors: Vec<String> },
+    Scanned { files: Vec<PathBuf>, errors: Vec<String> },
+    Covered(fw::Coverage),
     Progress(usize, usize),
     Blocked(BlockReport),
     Listed(Result<Vec<BlockedProgram>, String>),
@@ -58,12 +67,14 @@ struct App {
     rx: Receiver<Msg>,
     busy: Option<String>,
     progress: Option<(usize, usize)>,
-    icon: Option<egui::TextureHandle>,
     upd: Upd,
+    /// block rules currently in the firewall
+    covered: fw::Coverage,
+    /// latest result of the background scan
+    background: Arc<Mutex<Option<fw::Coverage>>>,
 
     folder: Option<PathBuf>,
     scan_files: Vec<PathBuf>,
-    scan_already: usize,
     folder_log: Vec<(bool, String)>,
 
     exes: Vec<PathBuf>,
@@ -72,9 +83,19 @@ struct App {
     blocked: Vec<BlockedProgram>,
     selected: HashSet<String>,
     filter: String,
+    /// expanded program groups
+    open: HashSet<String>,
     loaded: bool,
     list_msg: Option<(bool, String)>,
     confirm_all: bool,
+
+    close_to_tray: bool,
+    /// present while "close to tray" is on
+    tray: Option<tray_icon::TrayIcon>,
+    window: Option<tray::Window>,
+    /// set when the app really has to exit, so closing does not just hide it
+    quit: Arc<AtomicBool>,
+    settings_msg: Option<String>,
 }
 
 fn is_elevated() -> bool {
@@ -104,6 +125,9 @@ fn main() -> eframe::Result<()> {
         }
         return Ok(()); // the elevated copy (if any) took over
     }
+    let Some(instance) = tray::claim_instance() else {
+        return Ok(()); // already running (maybe in the tray): its window opens instead
+    };
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1000.0, 660.0])
@@ -117,7 +141,7 @@ fn main() -> eframe::Result<()> {
             .with_drag_and_drop(true),
         ..Default::default()
     };
-    eframe::run_native("Firewall Manager", opts, Box::new(|cc| Ok(Box::new(App::new(cc)))))
+    eframe::run_native("Firewall Manager", opts, Box::new(move |cc| Ok(Box::new(App::new(cc, instance)))))
 }
 
 /// JetBrains Mono (SIL OFL, see assets/fonts) for everything; a separate "bold" family for emphasis.
@@ -173,37 +197,72 @@ fn setup_style(ctx: &egui::Context) {
 }
 
 impl App {
-    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, instance: tray::Instance) -> Self {
         setup_style(&cc.egui_ctx);
-        let icon = {
-            let img = egui::ColorImage::from_rgba_unmultiplied([64, 64], include_bytes!("../assets/icon.rgba"));
-            Some(cc.egui_ctx.load_texture("icon", img, egui::TextureOptions::LINEAR))
-        };
         let (tx, rx) = channel();
+        let background = Arc::new(Mutex::new(None));
+        {
+            let (slot, ctx) = (background.clone(), cc.egui_ctx.clone());
+            std::thread::spawn(move || loop {
+                std::thread::sleep(SCAN_EVERY);
+                if let Ok(c) = fw::coverage() {
+                    if let Ok(mut s) = slot.lock() {
+                        *s = Some(c);
+                    }
+                    ctx.request_repaint();
+                }
+            });
+        }
+        let quit = Arc::new(AtomicBool::new(false));
+        let window = tray::Window::of(cc);
+        cc.egui_ctx.send_viewport_cmd(egui::ViewportCommand::SetTheme(egui::SystemTheme::Dark));
+        if let Some(w) = window {
+            w.color_title_bar(PANEL, TEXT);
+            tray::listen(instance, w, cc.egui_ctx.clone(), quit.clone());
+        }
         let mut app = App {
             tab: Tab::Folder,
             tx,
             rx,
             busy: None,
             progress: None,
-            icon,
             upd: Upd::Checking,
+            covered: Default::default(),
+            background,
             folder: None,
             scan_files: vec![],
-            scan_already: 0,
             folder_log: vec![],
             exes: vec![],
             exe_log: vec![],
             blocked: vec![],
             selected: Default::default(),
             filter: String::new(),
+            open: Default::default(),
             loaded: false,
             list_msg: None,
             confirm_all: false,
+            close_to_tray: tray::load_close_to_tray(),
+            tray: None,
+            window,
+            quit,
+            settings_msg: None,
         };
+        app.apply_tray();
         app.reload(&cc.egui_ctx);
         app.check_update(&cc.egui_ctx);
         app
+    }
+
+    /// Creates or removes the tray icon to match the setting.
+    fn apply_tray(&mut self) {
+        if !self.close_to_tray {
+            self.tray = None;
+        } else if self.tray.is_none() {
+            match tray::icon() {
+                Ok(t) => self.tray = Some(t),
+                Err(e) => self.settings_msg = Some(format!("Tray icon not available: {e}")),
+            }
+        }
     }
 
     fn check_update(&mut self, ctx: &egui::Context) {
@@ -247,9 +306,7 @@ impl App {
     }
 
     fn reload(&mut self, ctx: &egui::Context) {
-        self.spawn("Loading rules...", ctx, |tx| {
-            let _ = tx.send(Msg::Listed(fw::list_blocked()));
-        });
+        self.spawn("Loading rules...", ctx, send_listing);
     }
 
     fn scan(&mut self, ctx: &egui::Context, dir: PathBuf) {
@@ -258,9 +315,10 @@ impl App {
         self.folder_log.clear();
         self.spawn("Scanning folder...", ctx, move |tx| {
             let (files, errors) = fw::scan_exes(&dir);
-            let have = fw::blocked_set().unwrap_or_default();
-            let already = files.iter().filter(|f| have.contains(&fw::path_key(&f.to_string_lossy()))).count();
-            let _ = tx.send(Msg::Scanned { files, already, errors });
+            if let Ok(c) = fw::coverage() {
+                let _ = tx.send(Msg::Covered(c));
+            }
+            let _ = tx.send(Msg::Scanned { files, errors });
         });
     }
 
@@ -306,12 +364,13 @@ impl App {
                 Msg::UpdateProgress(s) => self.upd = Upd::Installing(s),
                 Msg::UpdateFailed(e) => self.upd = Upd::Failed(e),
                 Msg::UpdateStarted => {
+                    self.quit.store(true, Ordering::SeqCst);
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close); // the installer takes over
                 }
                 Msg::Progress(d, t) => self.progress = Some((d, t)),
-                Msg::Scanned { files, already, errors } => {
+                Msg::Covered(c) => self.covered = c,
+                Msg::Scanned { files, errors } => {
                     self.busy = None;
-                    self.scan_already = already;
                     self.scan_files = files;
                     self.folder_log.extend(errors.into_iter().map(|e| (false, e)));
                 }
@@ -322,16 +381,13 @@ impl App {
                         rep.errors.is_empty(),
                         format!("{} blocked, {} already blocked, {} failed", rep.blocked, rep.skipped, rep.errors.len()),
                     ));
-                    self.loaded = false;
                     if self.tab == Tab::Folder {
-                        if let Some(d) = self.folder.clone() {
-                            self.scan(ctx, d); // refreshes "already blocked"
-                        }
                         self.folder_log = log;
                     } else {
                         self.exe_log = log;
                         self.exes.clear();
                     }
+                    self.reload(ctx);
                 }
                 Msg::Listed(r) => {
                     self.busy = None;
@@ -363,12 +419,26 @@ impl App {
                     match self.tab {
                         Tab::Folder => self.folder_log = vec![(false, e)],
                         Tab::Exe => self.exe_log = vec![(false, e)],
-                        Tab::Blocked => self.list_msg = Some((false, e)),
+                        Tab::Blocked | Tab::Settings => self.list_msg = Some((false, e)),
                     }
                 }
             }
         }
+        // Rules changed outside this window: refresh. While busy, the next scan catches up.
+        let scanned = self.background.lock().ok().and_then(|mut s| s.take());
+        if self.busy.is_none() && scanned.is_some_and(|c| c != self.covered) {
+            self.reload(ctx);
+        }
     }
+}
+
+/// Sends the current block rules and the list of blocked programs.
+fn send_listing(tx: &Sender<Msg>) {
+    let list = fw::list_blocked();
+    if let Ok(c) = fw::coverage() {
+        let _ = tx.send(Msg::Covered(c));
+    }
+    let _ = tx.send(Msg::Listed(list));
 }
 
 // ---- small widgets ----------------------------------------------------------
@@ -386,6 +456,15 @@ fn card<R>(ui: &mut egui::Ui, fill: Color32, add: impl FnOnce(&mut egui::Ui) -> 
         .inner
 }
 
+/// Filled circle with an "i", painted so it does not depend on a font glyph.
+fn info_icon(ui: &mut egui::Ui) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
+    let (p, c) = (ui.painter(), rect.center());
+    p.circle_filled(c, 9.0, INFO);
+    p.circle_filled(c + egui::vec2(0.0, -4.2), 1.6, BG);
+    p.rect_filled(egui::Rect::from_center_size(c + egui::vec2(0.0, 2.2), egui::vec2(2.8, 7.4)), 1.0, BG);
+}
+
 /// Explanation box shown at the top of the block pages.
 fn info_box(ui: &mut egui::Ui, title: &str, lines: &[&str]) {
     egui::Frame::new()
@@ -396,7 +475,7 @@ fn info_box(ui: &mut egui::Ui, title: &str, lines: &[&str]) {
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
-                ui.label(bold("i", 13.0).color(INFO));
+                info_icon(ui);
                 ui.label(bold(title, 12.5).color(INFO));
             });
             for l in lines {
@@ -445,6 +524,13 @@ fn path_label(p: &str) -> RichText {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll(ctx);
+        // Only hide while there is a tray icon to bring the window back.
+        if ctx.input(|i| i.viewport().close_requested()) && self.tray.is_some() && !self.quit.load(Ordering::SeqCst) {
+            if let Some(w) = self.window {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                w.hide();
+            }
+        }
         let idle = self.busy.is_none();
 
         // Drag & drop: a folder starts a scan, .exe files go to the Block EXE page.
@@ -477,6 +563,7 @@ impl eframe::App for App {
                     Tab::Folder => self.folder_ui(ui, ctx),
                     Tab::Exe => self.exe_ui(ui, ctx),
                     Tab::Blocked => self.blocked_ui(ui, ctx),
+                    Tab::Settings => self.settings_ui(ui),
                 });
             });
     }
@@ -488,17 +575,6 @@ impl App {
             .exact_width(210.0)
             .frame(egui::Frame::new().fill(PANEL).inner_margin(egui::Margin::same(16)))
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    if let Some(t) = &self.icon {
-                        ui.image((t.id(), egui::vec2(34.0, 34.0)));
-                    }
-                    ui.vertical(|ui| {
-                        ui.add_space(-2.0);
-                        ui.label(bold("Firewall", 14.0));
-                        ui.label(bold("Manager", 14.0));
-                    });
-                });
-                ui.add_space(18.0);
                 let items = [
                     (Tab::Folder, "Block Folder".to_string()),
                     (Tab::Exe, "Block EXE".to_string()),
@@ -506,6 +582,7 @@ impl App {
                         Tab::Blocked,
                         if self.loaded { format!("Blocked Programs  ({})", self.blocked.len()) } else { "Blocked Programs".into() },
                     ),
+                    (Tab::Settings, "Settings".to_string()),
                 ];
                 let mut next = self.tab;
                 for (t, label) in items {
@@ -610,7 +687,7 @@ impl App {
             &[
                 "Scans the chosen folder and all of its subfolders for .exe files.",
                 "Creates two Windows Firewall block rules per program: one for incoming and one for outgoing connections.",
-                "Programs that are already blocked are skipped, so nothing is created twice.",
+                "Existing block rules, also from other tools, are detected, so nothing is created twice.",
                 "No file is changed or deleted. You can undo it any time under Blocked Programs.",
             ],
         );
@@ -628,10 +705,11 @@ impl App {
 
         if self.folder.is_some() && !self.scan_files.is_empty() {
             let total = self.scan_files.len();
-            let new = total - self.scan_already;
+            let already = self.scan_files.iter().filter(|f| fw::is_blocked(&self.covered, &f.to_string_lossy())).count();
+            let new = total - already;
             ui.horizontal(|ui| {
                 chip(ui, &format!("{total} found"), INFO);
-                chip(ui, &format!("{} already blocked", self.scan_already), MUTED);
+                chip(ui, &format!("{already} already blocked"), MUTED);
                 chip(ui, &format!("{new} new"), if new > 0 { WARN } else { MUTED });
             });
             card(ui, PANEL, |ui| {
@@ -670,6 +748,7 @@ impl App {
                 "Creates an incoming and an outgoing Windows Firewall block rule for each chosen program.",
                 "Only that exact file is blocked. A copy or another version of the program in a different folder is not.",
                 "Already blocked programs are skipped. No file is changed. Undo any time under Blocked Programs.",
+                "Block rules made by other tools count as blocked and are never changed or removed.",
             ],
         );
         ui.horizontal(|ui| {
@@ -687,12 +766,18 @@ impl App {
             card(ui, PANEL, |ui| {
                 egui::ScrollArea::vertical().id_salt("exelist").max_height(220.0).auto_shrink([false, true]).show(ui, |ui| {
                     for p in &self.exes {
-                        ui.label(path_label(&p.display().to_string()));
+                        ui.horizontal(|ui| {
+                            if fw::is_blocked(&self.covered, &p.to_string_lossy()) {
+                                chip(ui, "Already blocked", MUTED);
+                            }
+                            ui.label(path_label(&p.display().to_string()));
+                        });
                     }
                 });
             });
             ui.horizontal(|ui| {
-                if ui.add(primary(format!("Block {} program(s)", self.exes.len()))).clicked() {
+                let new = self.exes.iter().filter(|p| !fw::is_blocked(&self.covered, &p.to_string_lossy())).count();
+                if ui.add_enabled(new > 0, primary(format!("Block {new} new program(s)"))).clicked() {
                     let f = self.exes.clone();
                     self.block(ctx, f);
                 }
@@ -702,6 +787,28 @@ impl App {
             });
         }
         log_view(ui, &self.exe_log);
+    }
+
+    fn settings_ui(&mut self, ui: &mut egui::Ui) {
+        page_header(ui, "Settings", "How Firewall Manager behaves.");
+        card(ui, PANEL, |ui| {
+            if ui.checkbox(&mut self.close_to_tray, "Close to tray").changed() {
+                self.settings_msg = tray::save_close_to_tray(self.close_to_tray)
+                    .err()
+                    .map(|e| format!("Setting not saved: {e}"));
+                self.apply_tray();
+            }
+            ui.label(
+                RichText::new(
+                    "Closing the window keeps the app running next to the clock.\n\
+                     Click the tray icon to open it again, right-click it to quit.",
+                )
+                .color(MUTED),
+            );
+            if let Some(m) = &self.settings_msg {
+                ui.label(RichText::new(m).color(BAD));
+            }
+        });
     }
 
     fn blocked_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -726,7 +833,7 @@ impl App {
                 if lost > 0 && ui.button(format!("Restore {lost} missing")).clicked() {
                     self.spawn("Restoring rules...", ctx, |tx| {
                         let _ = fw::restore_missing();
-                        let _ = tx.send(Msg::Listed(fw::list_blocked()));
+                        send_listing(tx);
                     });
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -789,12 +896,21 @@ impl App {
             return;
         }
 
+        let groups = group_programs(&self.blocked, &shown);
+        let mut rows = Vec::new();
+        for (g, group) in groups.iter().enumerate() {
+            rows.push(Row::Head(g));
+            // searching opens every group that has a match
+            if !f.is_empty() || self.open.contains(&group.key) {
+                rows.extend(group.items.iter().map(|&i| Row::Item(i)));
+            }
+        }
+
         // Column header (same widths as the rows below)
         ui.horizontal(|ui| {
-            ui.add_space(42.0);
-            for (w, t) in [(204.0, "PROGRAM"), (104.0, "DIRECTION"), (104.0, "STATE")] {
-                ui.scope(|ui| {
-                    ui.set_width(w);
+            ui.add_space(ROW_LEAD);
+            for (w, t) in [(NAME_W, "PROGRAM"), (CHIP_W, "DIRECTION"), (CHIP_W, "STATE")] {
+                column(ui, w, |ui| {
                     ui.label(bold(t, 10.5).color(MUTED));
                 });
             }
@@ -802,66 +918,169 @@ impl App {
         });
 
         let row_h = 34.0;
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show_rows(ui, row_h, shown.len(), |ui, range| {
-            for &i in &shown[range] {
-                let b = &self.blocked[i];
-                let key = fw::path_key(&b.path);
-                let sel = self.selected.contains(&key);
-                let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), row_h - 4.0), egui::Sense::click());
-                let fill = if sel {
-                    ACCENT.linear_multiply(0.16)
-                } else if resp.hovered() {
-                    CARD_HI
-                } else {
-                    CARD
-                };
-                ui.painter().rect_filled(rect, 8.0, fill);
-                if resp.clicked() {
-                    if sel {
-                        self.selected.remove(&key);
-                    } else {
-                        self.selected.insert(key);
-                    }
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show_rows(ui, row_h, rows.len(), |ui, range| {
+            for row in &rows[range] {
+                match *row {
+                    Row::Head(g) => self.group_row(ui, &groups[g], row_h, !f.is_empty()),
+                    Row::Item(i) => self.program_row(ui, i, row_h),
                 }
-                let mut rui = ui.new_child(
-                    egui::UiBuilder::new()
-                        .max_rect(rect.shrink2(egui::vec2(10.0, 0.0)))
-                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
-                );
-                let mut c = sel;
-                rui.add_enabled(false, egui::Checkbox::without_text(&mut c));
-                rui.add_space(6.0);
-                rui.scope(|ui| {
-                    ui.set_width(204.0);
-                    ui.add(egui::Label::new(bold(b.name.clone(), 12.0)).truncate());
-                });
-                let dir = match (b.inbound, b.outbound) {
-                    (true, true) => ("In + Out", OK),
-                    (true, false) => ("In only", WARN),
-                    (false, true) => ("Out only", WARN),
-                    _ => ("none", MUTED),
-                };
-                rui.scope(|ui| {
-                    ui.set_width(104.0);
-                    chip(ui, dir.0, dir.1);
-                });
-                rui.scope(|ui| {
-                    ui.set_width(104.0);
-                    if !b.active_rules {
-                        chip(ui, "Not in firewall", WARN);
-                    } else if b.enabled {
-                        chip(ui, "Active", OK);
-                    } else {
-                        chip(ui, "Disabled", MUTED);
-                    }
-                });
-                let mut path = RichText::new(&b.path).monospace().size(10.5).color(if b.exists { MUTED } else { WARN });
-                if !b.exists {
-                    path = path.strikethrough();
-                }
-                rui.add(egui::Label::new(path).truncate())
-                    .on_hover_text(if b.exists { b.path.as_str() } else { "File no longer exists" });
             }
         });
+    }
+
+    fn group_row(&mut self, ui: &mut egui::Ui, group: &Group, row_h: f32, searching: bool) {
+        let keys: Vec<String> = group.items.iter().map(|&i| fw::path_key(&self.blocked[i].path)).collect();
+        let n = keys.iter().filter(|k| self.selected.contains(*k)).count();
+        let all = n == keys.len();
+        let open = searching || self.open.contains(&group.key);
+        let (resp, mut rui) = table_row(ui, row_h, CARD, all);
+        let (arrow, _) = rui.allocate_exact_size(egui::vec2(ARROW_W, 14.0), egui::Sense::hover());
+        let c = arrow.center();
+        let points = if open {
+            [(-4.0, -2.5), (4.0, -2.5), (0.0, 3.5)]
+        } else {
+            [(-2.5, -4.0), (3.5, 0.0), (-2.5, 4.0)]
+        };
+        let points = points.iter().map(|&(x, y)| c + egui::vec2(x, y)).collect();
+        rui.painter().add(egui::Shape::convex_polygon(points, INFO, egui::Stroke::NONE));
+        column(&mut rui, CHECK_W, |ui| {
+            let mut checked = all;
+            ui.visuals_mut().widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, ACCENT);
+            if ui.add(egui::Checkbox::without_text(&mut checked).indeterminate(n > 0 && !all)).changed() {
+                for k in &keys {
+                    if checked {
+                        self.selected.insert(k.clone());
+                    } else {
+                        self.selected.remove(k);
+                    }
+                }
+            }
+        });
+        column(&mut rui, NAME_W, |ui| {
+            ui.add(egui::Label::new(bold(format!("{} ({})", group.name, keys.len()), 12.0)).truncate().selectable(false));
+        });
+        for chip_of in [direction_chip, state_chip] {
+            let first = chip_of(&self.blocked[group.items[0]]);
+            let same = group.items.iter().all(|&i| chip_of(&self.blocked[i]) == first);
+            let (text, color) = if same { first } else { ("Mixed", WARN) };
+            column(&mut rui, CHIP_W, |ui| chip(ui, text, color));
+        }
+        rui.add(egui::Label::new(RichText::new(&group.dir).monospace().size(10.5).color(MUTED)).truncate().selectable(false));
+        if resp.clicked() && !searching && !self.open.remove(&group.key) {
+            self.open.insert(group.key.clone());
+        }
+    }
+
+    fn program_row(&mut self, ui: &mut egui::Ui, i: usize, row_h: f32) {
+        let b = &self.blocked[i];
+        let key = fw::path_key(&b.path);
+        let sel = self.selected.contains(&key);
+        let (resp, mut rui) = table_row(ui, row_h, PANEL, sel);
+        rui.add_space(INDENT);
+        // empty arrow slot keeps the checkbox in line with the group's, shifted by the indent
+        rui.allocate_exact_size(egui::vec2(ARROW_W, 14.0), egui::Sense::hover());
+        column(&mut rui, CHECK_W, |ui| {
+            let mut c = sel;
+            ui.add_enabled(false, egui::Checkbox::without_text(&mut c));
+        });
+        column(&mut rui, NAME_W - INDENT, |ui| {
+            ui.add(egui::Label::new(RichText::new(&b.name).size(12.0)).truncate().selectable(false));
+        });
+        for (text, color) in [direction_chip(b), state_chip(b)] {
+            column(&mut rui, CHIP_W, |ui| chip(ui, text, color));
+        }
+        let mut path = RichText::new(&b.path).monospace().size(10.5).color(if b.exists { MUTED } else { WARN });
+        if !b.exists {
+            path = path.strikethrough();
+        }
+        rui.add(egui::Label::new(path).truncate())
+            .on_hover_text(if b.exists { b.path.as_str() } else { "File no longer exists" });
+        if resp.clicked() && !self.selected.remove(&key) {
+            self.selected.insert(key);
+        }
+    }
+}
+
+// ---- grouped table ------------------------------------------------------------
+
+const ARROW_W: f32 = 14.0;
+const CHECK_W: f32 = 30.0;
+const NAME_W: f32 = 204.0;
+const CHIP_W: f32 = 104.0;
+const INDENT: f32 = 20.0;
+/// left padding + arrow + checkbox, including item spacing
+const ROW_LEAD: f32 = 10.0 + ARROW_W + 10.0 + CHECK_W + 10.0;
+
+/// All shown programs that live in the same program folder.
+struct Group {
+    key: String,
+    name: String,
+    dir: String,
+    items: Vec<usize>,
+}
+
+#[derive(Clone, Copy)]
+enum Row {
+    Head(usize),
+    Item(usize),
+}
+
+/// Groups the shown programs by program folder, sorted by folder name.
+fn group_programs(blocked: &[BlockedProgram], shown: &[usize]) -> Vec<Group> {
+    let mut map: BTreeMap<(String, String), Group> = BTreeMap::new();
+    for &i in shown {
+        let dir = fw::program_dir(&blocked[i].path);
+        let key = fw::path_key(&dir);
+        let name = dir.rsplit('\\').next().unwrap_or_default().to_string();
+        map.entry((name.to_lowercase(), key.clone()))
+            .or_insert_with(|| Group { key, name, dir, items: vec![] })
+            .items
+            .push(i);
+    }
+    map.into_values().collect()
+}
+
+/// Clickable row background plus a left-to-right area for its cells.
+fn table_row(ui: &mut egui::Ui, row_h: f32, base: Color32, selected: bool) -> (egui::Response, egui::Ui) {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), row_h - 4.0), egui::Sense::click());
+    let fill = if selected {
+        ACCENT.linear_multiply(0.16)
+    } else if resp.hovered() {
+        CARD_HI
+    } else {
+        base
+    };
+    ui.painter().rect_filled(rect, 8.0, fill);
+    let cells = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect.shrink2(egui::vec2(10.0, 0.0)))
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    (resp, cells)
+}
+
+fn column(ui: &mut egui::Ui, width: f32, add: impl FnOnce(&mut egui::Ui)) {
+    ui.scope(|ui| {
+        ui.set_width(width);
+        add(ui);
+    });
+}
+
+fn direction_chip(b: &BlockedProgram) -> (&'static str, Color32) {
+    match (b.inbound, b.outbound) {
+        (true, true) => ("In + Out", OK),
+        (true, false) => ("In only", WARN),
+        (false, true) => ("Out only", WARN),
+        _ => ("none", MUTED),
+    }
+}
+
+fn state_chip(b: &BlockedProgram) -> (&'static str, Color32) {
+    if !b.active_rules {
+        ("Not in firewall", WARN)
+    } else if b.enabled {
+        ("Active", OK)
+    } else {
+        ("Disabled", MUTED)
     }
 }
